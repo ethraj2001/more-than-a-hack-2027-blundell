@@ -25,18 +25,30 @@ from sklearn.ensemble import HistGradientBoostingClassifier
 
 from possession import config
 from possession.experts import SWAP_BOUNDARY, SWAP_STATE
-from possession.features import rolling_mean
+from possession.features import _gap_clocks, rolling_mean
 from possession.tracking import period_blocks
 
 # Params
 CONTEXT = ("S.ball_vis.0", "S.ball_vis.w25", "S.since_seen.0", "S.until_seen.0", "S.gap_len.0",
            "S.n_vis.0", "A.cnt.0", "B.cnt.0")
+# With Smart Tagging and config.TAGS_AGREEMENT on, how far this game's tags agree with its
+# tracking (tagging.agreement).
+TAG_CONTEXT = ("S.tag_agree_att.0", "S.tag_agree_def.0", "S.tag_agree_set.0")
 EPS = 1e-4
 # Frames. Shifts reach two seconds each way; windows average over up to ten seconds.
 OFFSETS = (-50, -25, -12, -5, -2, 2, 5, 12, 25, 50)
 WINDOWS = (12, 50, 125)
 SIDE = 25                      # past-only and future-only means, for before/after contrasts
 BOUNDARY_OFFSETS = (-5, -2, 2, 5)
+BOUNDARY_NAMES = ("BH", "BA", "BD")  # output names ending in these are change probabilities
+# The first gate's outputs, as the refiner (a second gate) sees them beside the experts'.
+GATE_OUTPUTS = ("gate.H", "gate.A", "gate.D", "gate.BH", "gate.BA", "gate.BD")
+
+
+def context_names():
+    """The gate's context columns for the current config."""
+    tagged = config.USE_TAGS and config.TAGS_AGREEMENT
+    return list(CONTEXT) + (list(TAG_CONTEXT) if tagged else [])
 
 
 def logit(p):
@@ -62,7 +74,9 @@ class Gate(object):
         self.params = params or config.GATE_HGB
         self.temporal = temporal
         self.boundary_columns = [i for i, n in enumerate(self.output_names)
-                                 if n.startswith("transition.")]
+                                 if n.split(".")[-1] in BOUNDARY_NAMES]
+        self.touch_columns = ([i for i, n in enumerate(self.output_names) if n.startswith("touch.")]
+                              if config.GATE_TOUCH_CLOCKS else [])
         self.state_columns = [i for i in range(len(self.output_names))
                               if i not in self.boundary_columns]
         self.state_model = self.boundary_model = None
@@ -75,7 +89,7 @@ class Gate(object):
         expert = item["E"] if order == (0, 1) else item["E"][:, self.swap_index]
         full = np.full((n, expert.shape[1]), np.nan)
         full[item["rows"]] = logit(expert)
-        context = np.full((n, len(CONTEXT)), np.nan, dtype=np.float32)
+        context = np.full((n, item["ctx_ab"].shape[1]), np.nan, dtype=np.float32)
         context[item["rows"]] = item["ctx_ab"] if order == (0, 1) else item["ctx_ba"]
         parts = [full[rows], context[rows]]
         if self.temporal:
@@ -85,9 +99,10 @@ class Gate(object):
     def _temporal(self, full, period):
         """Shifted and window-averaged expert outputs, never reaching across a period edge."""
         n = len(full)
-        state, boundary = self.state_columns, self.boundary_columns
+        state, boundary, touch = self.state_columns, self.boundary_columns, self.touch_columns
         width = (len(state) * (len(OFFSETS) + len(WINDOWS) + 2)
-                 + len(boundary) * (len(BOUNDARY_OFFSETS) + 1))
+                 + len(boundary) * (len(BOUNDARY_OFFSETS) + 1)
+                 + (2 * len(touch) + 2 if touch else 0))
         out = np.full((n, width), np.nan, dtype=np.float32)
         for start, stop, _ in period_blocks(period):
             block = full[start:stop]
@@ -102,6 +117,12 @@ class Gate(object):
                 values = block[:, j]
                 columns.extend(_shift(values, k) for k in BOUNDARY_OFFSETS)
                 columns.append(rolling_mean(values, 5, 5))
+            if touch:  # logit > 0 is P(touch) > 0.5
+                clocks = [_gap_clocks(block[:, j] > 0)[:2] for j in touch]
+                for since, until in clocks:
+                    columns.extend((since, until))
+                columns.append(clocks[0][0] - clocks[1][0])  # who touched last, H minus A
+                columns.append(clocks[0][1] - clocks[1][1])  # who touches next
             out[start:stop] = np.column_stack(columns)
         return out
 
@@ -110,19 +131,22 @@ class Gate(object):
     def fit(self, items, stride, training_rows):
         """items: out-of-fold expert outputs per game, with labels. training_rows: the pipeline's
         row sampler, so the gate samples frames exactly as the experts do."""
-        X_state, y_state, X_bound, y_bound = [], [], [], []
+        X_state, y_state, w_state, X_bound, y_bound = [], [], [], [], []
         for item in items:
             labels, period = item["labels"], item["period"]
             rows, is_stride, boundary = training_rows(labels, period, stride)
-            rows_state = rows[is_stride]
+            rows_state = rows if config.GATE_STATE_ALL_ROWS else rows[is_stride]
+            weight = run_lengths(labels, period)[rows_state] ** -float(config.GATE_SPELL_WEIGHT)
+            weight = weight / weight.mean()
             for order, swap_y, swap_b in (((0, 1), np.arange(3), np.arange(4)),
                                           ((1, 0), SWAP_STATE, SWAP_BOUNDARY)):
                 X_state.append(self._inputs(item, order, rows_state))
                 y_state.append(swap_y[labels[rows_state]])
+                w_state.append(weight)
                 X_bound.append(self._inputs(item, order, rows))
                 y_bound.append(swap_b[boundary[rows]])
         self.state_model = HistGradientBoostingClassifier(**self.params).fit(
-            np.vstack(X_state), np.concatenate(y_state))
+            np.vstack(X_state), np.concatenate(y_state), sample_weight=np.concatenate(w_state))
         self.boundary_model = HistGradientBoostingClassifier(**self.params).fit(
             np.vstack(X_bound), np.concatenate(y_bound))
         return self
@@ -139,6 +163,15 @@ class Gate(object):
         bound[rows] = 0.5 * (_proba(self.boundary_model, ab, 1)
                              + _proba(self.boundary_model, ba, 1)[:, SWAP_STATE])
         return probs, bound
+
+
+def run_lengths(labels, period):
+    """Per frame: the length in frames of the run of equal labels it sits in, within its period."""
+    n = len(labels)
+    edge = np.ones(n + 1, dtype=bool)
+    edge[1:-1] = (labels[1:] != labels[:-1]) | (period[1:] != period[:-1])
+    bounds = np.flatnonzero(edge)
+    return np.repeat(np.diff(bounds), np.diff(bounds)).astype(np.float64)
 
 
 def _proba(model, X_rows, shift):

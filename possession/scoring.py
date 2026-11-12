@@ -36,6 +36,12 @@ def spell_f1(gt_codes, pred_codes):
     return pm.spell_scores(gt_codes, filled, runs)["mean_f1"]
 
 
+def macro_f1(gt_codes, pred_codes):
+    """The tie-break metric alone, computed as the scorer computes it."""
+    cm = pm.confusion(np.asarray(gt_codes, np.int8), np.asarray(pred_codes, np.int8))
+    return pm.macro_f1(pm.scored_confusion(cm))
+
+
 def paired_spell_bootstrap(games, n_draws=1000, seed=0):
     """Mean spellF1 difference (B - A) over games, with a paired bootstrap interval.
 

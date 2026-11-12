@@ -17,6 +17,12 @@ Column names: "A.<base>.<context>", "B.<base>.<context>", "AmB.<base>.<context>"
 "S.<base>.<context>" (shared). Contexts: "0" raw, "w5"/"w25"/"w75" centred means, "past"/"fut"
 means over the second before and after, "chg" = fut - past, and for the few series that time a
 touch "p5"/"f5"/"c5" and "p12"/"f12"/"c12", the same over 0.2 s and 0.5 s.
+
+Touches get series of their own: per team, how hard the ball changed velocity next to one of its
+players, and the frames since that team last touched the ball and until it next does. Possession
+is who touched it last, and the since/until clocks carry that across seconds. So does reach: how
+soon each team's quickest player can get to the ball, now and where it will be, which says who
+wins a loose ball or cuts out a pass.
 """
 
 import warnings
@@ -27,26 +33,36 @@ from possession import config
 from possession.tracking import period_blocks
 
 # Params
+# Fitted ball kinematics (_fitted), one series of each per window in config.FIT_HALVES.
+FIT_TEAM = tuple("fit_touch{}".format(half) for half in config.FIT_HALVES)
+FIT_SHARED = tuple("fit_{}{}".format(kind, half) for half in config.FIT_HALVES
+                   for kind in ("dv", "dspd"))
 TEAM_CONTEXT = ("d_ball", "n_r2", "near", "cx_att", "sx", "sy", "spd_mean", "still", "fwd_vel",
                 "q10", "q90")
-TEAM_TRANSITION = ("near", "d_ball", "cx_att", "fwd_vel", "q90", "sx")
+TEAM_TRANSITION = ("near", "d_ball", "cx_att", "fwd_vel", "q90", "sx", "reach")
 SHARED_CONTEXT = ("ball_vis", "ball_speed", "ball_dv", "margin", "all_spd_mean", "all_still")
 SHARED_TRANSITION = ("all_spd_mean", "ball_vis", "margin")
 # A touch shows as the ball speeding up or slowing down next to one team's player, so these get
 # the short before/after windows as well.
-TEAM_SHORT = ("near", "d_ball", "n_r2")
+TEAM_SHORT = ("near", "d_ball", "n_r2", "touch", "reach", "acc_max", "acc_near") + FIT_TEAM
+SHARED_LOOSE = ("contest",)
 SHARED_SHORT = ("ball_speed", "ball_dspd", "ball_vis")
 DIFF_BASES = ("d_ball", "n_r2", "near", "cx_att", "fwd_vel", "q90", "sx", "spd_mean", "car_max",
-              "car_sum")
+              "car_sum", "touch", "since_touch", "until_touch", "reach", "reach10", "reach25",
+              "acc_max", "acc_near", "tag_att", "tag_def", "tag_set", "gap_last", "gap_next"
+              ) + FIT_TEAM
 # Series added later by the carrier model (carrier.py), and the contexts they get.
 CARRIER_TEAM = ("car_max", "car_sum")
 CARRIER_SHARED = ("car_top",)
+CARRIER_CONTEXTS = ((CARRIER_TEAM, CARRIER_TEAM, CARRIER_TEAM), (CARRIER_SHARED, CARRIER_SHARED, ()))
 
 TEAM_BASES = ("cnt", "cx_att", "cy_abs", "sx", "sy", "q10", "q90", "spd_mean", "still",
-              "fwd_vel", "d_ball", "d_ball2", "n_r2", "n_r5", "near", "bx_att")
+              "fwd_vel", "d_ball", "d_ball2", "n_r2", "n_r5", "near", "bx_att", "touch",
+              "since_touch", "until_touch", "reach", "reach10", "reach25", "acc_max", "acc_near"
+              ) + FIT_TEAM
 SHARED_BASES = ("ball_vis", "ball_avail", "since_seen", "until_seen", "gap_len", "ball_speed",
                 "ball_dv", "ball_dspd", "ball_turn", "margin", "margin_goal", "margin_touch",
-                "all_spd_mean", "all_still", "n_vis")
+                "all_spd_mean", "all_still", "n_vis") + FIT_SHARED
 
 
 class FeatureSet(object):
@@ -100,18 +116,18 @@ def compute(tracking):
     return FeatureSet(team, shared, n)
 
 
-def extend(feature_set, period, team_series, shared_series):
-    """Add series computed outside this module -- the carrier model's -- with the same windows
-    the built-in ones get, each kept inside its period."""
+def extend(feature_set, period, team_series, shared_series, contexts=CARRIER_CONTEXTS):
+    """Add series computed outside this module -- the carrier model's, Smart Tagging's -- with
+    windows like the built-in ones, each kept inside its period. contexts: (team, shared), each
+    (context keys, transition keys, short keys) as _contexts() takes them."""
     n = feature_set.n_frames
+    team_keys, shared_keys = contexts
     for start, stop, _ in period_blocks(period):
         for k in (0, 1):
             block = {key: values[start:stop] for key, values in team_series[k].items()}
-            _put(feature_set.team[k], _contexts(block, CARRIER_TEAM, CARRIER_TEAM, CARRIER_TEAM),
-                 start, stop, n)
+            _put(feature_set.team[k], _contexts(block, *team_keys), start, stop, n)
         block = {key: values[start:stop] for key, values in shared_series.items()}
-        _put(feature_set.shared, _contexts(block, CARRIER_SHARED, CARRIER_SHARED, ()),
-             start, stop, n)
+        _put(feature_set.shared, _contexts(block, *shared_keys), start, stop, n)
     return feature_set
 
 
@@ -157,7 +173,7 @@ def _block(tracking, start, stop):
         f["cy_abs"] = np.abs(np.nanmean(y_k, axis=1) - width / 2.0)
         f["sx"] = np.nanstd(x_att, axis=1)
         f["sy"] = np.nanstd(y_k, axis=1)
-        f["q10"], f["q90"] = np.nanpercentile(x_att, (10, 90), axis=1)
+        f["q10"], f["q90"] = _row_percentiles(x_att, (10, 90))
         f["spd_mean"] = np.nanmean(speed_k, axis=1)
         f["still"] = np.where(n_speed > 0, (speed_k < config.STILL_SPEED).sum(axis=1)
                               / np.maximum(n_speed, 1), np.nan)
@@ -172,6 +188,14 @@ def _block(tracking, start, stop):
         mine, other = team[k]["d_ball"], team[1 - k]["d_ball"]
         near = np.where(np.isnan(other), 1.0, (mine < other).astype(np.float64))
         team[k]["near"] = np.where(np.isnan(mine), np.where(np.isnan(other), np.nan, 0.0), near)
+    if config.TOUCH_FEATURES:
+        _touches(team, ball, fps)
+    if config.REACH_FEATURES:
+        _reach(team, players, velocity, visible, tracking.team, ball, fps)
+    if config.DYNAMICS_FEATURES:
+        _dynamics(team, players, distance, tracking.team, fps)
+    if config.GAP_FEATURES:
+        _gap_ends(team, raw_ball, ball_vis, x, y, visible, tracking.team)
 
     shared = {}
     shared["ball_vis"] = ball_vis.astype(np.float64)
@@ -194,9 +218,150 @@ def _block(tracking, start, stop):
     shared["all_still"] = np.where(n_speed > 0, (speed < config.STILL_SPEED).sum(axis=1)
                                    / np.maximum(n_speed, 1), np.nan)
     shared["n_vis"] = visible.sum(axis=1).astype(np.float64)
+    if config.FIT_FEATURES:
+        _fitted(team, shared, raw_ball, fps)
+    if config.GAP_FEATURES:
+        shared["gap_disp"] = _gap_displacement(raw_ball, ball_vis)
+    if config.CONTEST_FEATURES:
+        both = ((team[0]["d_ball"] < config.CONTEST_RADIUS)
+                & (team[1]["d_ball"] < config.CONTEST_RADIUS))
+        shared["contest"] = np.where(ball_avail, both.astype(np.float64), np.nan)
+        shared["contest_run"] = np.where(both, np.minimum(_run_lengths(both), config.CAP_FRAMES),
+                                         0.0)
 
     out_team = [_contexts(team[k], TEAM_CONTEXT, TEAM_TRANSITION, TEAM_SHORT) for k in (0, 1)]
-    return out_team, _contexts(shared, SHARED_CONTEXT, SHARED_TRANSITION, SHARED_SHORT)
+    return out_team, _contexts(shared, SHARED_CONTEXT, SHARED_TRANSITION,
+                               SHARED_SHORT + SHARED_LOOSE)
+
+
+def _touches(team, ball, fps):
+    """Per team: touch strength (m/s of velocity change, 0 when the other team is nearer or
+    nobody is in reach), and the frames since and until that team's last and next touch."""
+    half = config.TOUCH_HALF
+    jump = np.hypot(*((_shift(ball, -half) - ball) - (ball - _shift(ball, half))).T) * fps / half
+    for k in (0, 1):
+        mine, other = team[k]["d_ball"], team[1 - k]["d_ball"]
+        reach = (mine < config.TOUCH_RADIUS) & ~(other < mine)
+        touch = np.where(np.isnan(jump), np.nan, np.where(reach, jump, 0.0))
+        since, until, _ = _gap_clocks(np.nan_to_num(touch) > config.TOUCH_DV)
+        team[k]["touch"], team[k]["since_touch"], team[k]["until_touch"] = touch, since, until
+
+
+def _fitted(team, shared, raw_ball, fps):
+    """Velocity change between straight-line fits before and after each frame (_fitted_velocity),
+    per window in FIT_HALVES: its size and the speed gained (> 0 kicked, < 0 received), and per
+    team that size where one of its players is in reach and the other team's are not nearer --
+    the touch series, with the jitter averaged out rather than doubled."""
+    for half in config.FIT_HALVES:
+        before, after = _fitted_velocity(raw_ball, half)
+        change = np.hypot(*((after - before) * fps).T)
+        shared["fit_dv{}".format(half)] = change
+        shared["fit_dspd{}".format(half)] = (np.hypot(*after.T) - np.hypot(*before.T)) * fps
+        for k in (0, 1):
+            mine, other = team[k]["d_ball"], team[1 - k]["d_ball"]
+            reach = (mine < config.TOUCH_RADIUS) & ~(other < mine)
+            team[k]["fit_touch{}".format(half)] = np.where(np.isnan(change), np.nan,
+                                                           np.where(reach, change, 0.0))
+
+
+def _fitted_velocity(ball, half):
+    """(before, after): least-squares ball velocity, in metres per frame, over the half frames up
+    to each frame and the half frames from it, from the frames where the ball was seen. NaN where
+    a window holds fewer than three sightings."""
+    seen = ~np.isnan(ball[:, 0])
+    weight = seen.astype(np.float64)
+    position = np.where(seen[:, None], ball, 0.0)
+    out = []
+    for offsets in (range(-half, 1), range(0, half + 1)):
+        s0, s1, s2 = (np.zeros(len(ball)) for _ in range(3))
+        sx, sux = np.zeros_like(position), np.zeros_like(position)
+        for u in offsets:  # sums over the window of w, w u, w u^2, w x, w u x, at t + u
+            w = np.nan_to_num(_shift(weight, -u))
+            x = np.nan_to_num(_shift(position, -u))
+            s0 += w
+            s1 += u * w
+            s2 += u * u * w
+            sx += x
+            sux += u * x
+        det = s0 * s2 - s1 * s1
+        with np.errstate(invalid="ignore", divide="ignore"):
+            velocity = (s0[:, None] * sux - s1[:, None] * sx) / det[:, None]
+        velocity[(s0 < 3) | (det <= 0)] = np.nan
+        out.append(velocity)
+    return out
+
+
+def _sightings(seen):
+    """(last, next): per frame, the index of the latest sighting at or before it and of the
+    earliest at or after it; -1 and n where there is none."""
+    n = len(seen)
+    index = np.arange(n)
+    last = np.maximum.accumulate(np.where(seen, index, -1))
+    following = np.minimum.accumulate(np.where(seen, index, n)[::-1])[::-1]
+    return last, following
+
+
+def _gap_ends(team, raw_ball, seen, x, y, visible, slot_team):
+    """Per team: its nearest player's distance to the ball at the last sighting at or before
+    each frame (gap_last) and at the next one at or after it (gap_next). Equal to the distance now
+    on frames where the ball is seen."""
+    n = len(seen)
+    last, following = _sightings(seen)
+    distance = np.hypot(x - raw_ball[:, None, 0], y - raw_ball[:, None, 1])
+    for k in (0, 1):
+        mine = visible & (slot_team == k)[None, :]
+        nearest = np.nanmin(np.where(mine, distance, np.nan), axis=1)
+        team[k]["gap_last"] = np.where(last >= 0, nearest[np.clip(last, 0, n - 1)], np.nan)
+        team[k]["gap_next"] = np.where(following < n, nearest[np.clip(following, 0, n - 1)],
+                                       np.nan)
+
+
+def _gap_displacement(raw_ball, seen):
+    """How far the ball moved between the sightings either side of each frame: 0 when seen."""
+    n = len(seen)
+    last, following = _sightings(seen)
+    both = (last >= 0) & (following < n)
+    a, b = raw_ball[np.clip(last, 0, n - 1)], raw_ball[np.clip(following, 0, n - 1)]
+    return np.where(both, np.hypot(*(b - a).T), np.nan)
+
+
+def _run_lengths(mask):
+    """Per frame: the length of the run of equal values it sits in."""
+    edge = np.flatnonzero(np.diff(np.concatenate(([-1], mask.astype(np.int8), [-1]))) != 0)
+    return np.repeat(np.diff(edge), np.diff(edge)).astype(np.float64)
+
+
+def _dynamics(team, players, distance, slot_team, fps):
+    """Per team: the largest acceleration of any of its players (m/s^2, braking included), and
+    that of its player nearest the ball -- a receiver brakes, a passer's team-mates set off."""
+    half = config.DYNAMICS_HALF
+    velocity = _centred_diff(players, half) * fps
+    accel = _centred_diff(velocity, half) * fps
+    magnitude = np.hypot(accel[..., 0], accel[..., 1])
+    for k in (0, 1):
+        mine = (slot_team == k)[None, :] & ~np.isnan(magnitude)
+        team[k]["acc_max"] = np.nanmax(np.where(mine, magnitude, np.nan), axis=1)
+        reach = np.where(mine & ~np.isnan(distance), distance, np.inf)
+        nearest = np.argmin(reach, axis=1)
+        rows = np.arange(len(reach))
+        team[k]["acc_near"] = np.where(np.isfinite(reach[rows, nearest]),
+                                       magnitude[rows, nearest], np.nan)
+
+
+def _reach(team, players, velocity, visible, slot_team, ball, fps):
+    """Per team: seconds its quickest player needs to reach the ball -- reaction time, then
+    straight there at REACH_SPEED from where his velocity has carried him by then. For the ball's
+    position k frames later, the k frames are subtracted: below 0 means there before the ball."""
+    reaction = config.REACH_REACTION
+    start = players + np.nan_to_num(velocity) * reaction
+    for ahead in (0,) + tuple(config.REACH_AHEAD):
+        target = _shift(ball, -ahead) if ahead else ball
+        distance = np.hypot(start[..., 0] - target[:, None, 0], start[..., 1] - target[:, None, 1])
+        seconds = reaction + distance / config.REACH_SPEED - ahead / fps
+        for k in (0, 1):
+            mine = visible & (slot_team == k)[None, :]
+            team[k]["reach{}".format(ahead or "")] = np.nanmin(np.where(mine, seconds, np.nan),
+                                                               axis=1)
 
 
 def _contexts(base, context_keys, transition_keys, short_keys=()):
@@ -272,9 +437,30 @@ def _interpolate_gaps(ball, max_gap):
     return out
 
 
+def _row_percentiles(values, percents):
+    """np.nanpercentile(values, percents, axis=1), bit for bit, about 25x faster: numpy's NaN
+    version loops over rows in Python. One sort, then numpy's own "linear" interpolation."""
+    ordered = np.sort(values, axis=1)  # NaN sorts last
+    count = (~np.isnan(values)).sum(axis=1)
+    rows = np.arange(len(values))
+    top = np.maximum(count - 1, 0)
+    out = []
+    for q in np.true_divide(percents, 100):
+        virtual = (count - 1) * q
+        below = np.floor(virtual)
+        gamma = virtual - below
+        low = np.clip(below.astype(np.int64), 0, top)
+        a, b = ordered[rows, low], ordered[rows, np.minimum(low + 1, top)]
+        diff = b - a
+        value = np.where(gamma >= 0.5, b - diff * (1 - gamma), a + diff * gamma)
+        out.append(np.where(count > 0, value, np.nan))
+    return out
+
+
 def _gap_clocks(seen):
     """Frames since the ball was last seen, until it is next seen, and the length of the gap the
-    frame sits in -- all capped at CAP_FRAMES, all 0 on frames where the ball is seen."""
+    frame sits in -- all capped at CAP_FRAMES, all 0 on frames where the ball is seen. Works for
+    any per-frame event, not only sightings."""
     n = len(seen)
     index = np.arange(n)
     last = np.maximum.accumulate(np.where(seen, index, -10 ** 9))

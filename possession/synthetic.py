@@ -159,3 +159,45 @@ def write_atd(tracking, folder, stem="SYN"):
                 bx / length, by / width)
             handle.write("{}:{}:{}\n".format(frame + 1, ";".join(groups), ball))
     return meta_path, raw_path
+
+
+def broadcast_view(tracking, rng, start=300, skip=500, replays=3, replay_len=150,
+                   view=(40.0, 26.0), seen_run=150, lost_run=150, jitter=0.2, flip=(True, True)):
+    """A broadcast-like recording of a match, for broadcast.py: on its own timeline (it starts
+    start frames into the first half and skip frames into the second, leaving halftime out),
+    with replays (earlier play shown again in place of live play), a camera window of view metres
+    following the ball (players outside it unseen), the ball lost in runs of its own, positions
+    jittered, the pitch flipped as flip says and the slots shuffled. (Tracking, truth): truth[i]
+    is the frame of tracking that broadcast frame i shows live, -1 during a replay."""
+    halves = [np.flatnonzero(tracking.period == half) for half in (1, 2)]
+    source = np.concatenate([halves[0][start:], halves[1][skip:]])
+    truth = source.copy()
+    for at in rng.choice(np.arange(2000, len(source) - 2000, 2 * replay_len), replays, replace=False):
+        back = int(rng.integers(300, 1000))
+        source[at:at + replay_len] = source[at - back:at - back + replay_len]
+        truth[at:at + replay_len] = -1
+    players = tracking.players[source].copy()
+    ball = tracking.ball[source].copy()
+    centre = ball.copy()
+    for k in range(1, len(centre)):  # the camera holds where it last saw the ball
+        if np.isnan(centre[k, 0]):
+            centre[k] = centre[k - 1]
+    outside = ((np.abs(players[..., 0] - centre[:, None, 0]) > view[0] / 2)
+               | (np.abs(players[..., 1] - centre[:, None, 1]) > view[1] / 2))
+    players[outside] = np.nan
+    k, seen = 0, True
+    while k < len(ball):
+        run = int(rng.geometric(1.0 / (seen_run if seen else lost_run)))
+        if not seen:
+            ball[k:k + run] = np.nan
+        k, seen = k + run, not seen
+    players += rng.normal(0.0, jitter, players.shape).astype(np.float32)
+    ball += rng.normal(0.0, jitter, ball.shape).astype(np.float32)
+    for axis, (flipped, extent) in enumerate(zip(flip, tracking.pitch)):
+        if flipped:
+            players[..., axis] = extent - players[..., axis]
+            ball[..., axis] = extent - ball[..., axis]
+    order = rng.permutation(players.shape[1])
+    view_tracking = Tracking(tracking.name + " broadcast", players[:, order], tracking.team[order],
+                             ball, np.ones(len(source), dtype=np.int8), tracking.pitch, tracking.fps)
+    return view_tracking, truth

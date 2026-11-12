@@ -1,13 +1,15 @@
 """Command line for the possession pipeline. Run from the repository root.
 
-    python -m possession download                       # open DFL matches -> cache/dfl/
+    python -m possession download                       # open DFL + Metrica games -> cache/
     python -m possession profile                        # ATD noise statistics -> models/
-    python -m possession train                          # -> models/moe.pkl
+    python -m possession train                          # -> models/moe.pkl, flow model included
+    python -m possession train-flow                     # add the flow model to models/moe.pkl
     python -m possession predict --check                # -> evaluation/results/moe.csv, twice
     python -m possession evaluate --quick --jobs 4      # leave-one-game-out on DFL -> reports/
     python -m possession compare reports/a reports/b    # paired difference between two versions
 
-`profile` and `predict` read the provided match, so run them on your own machine: the terms forbid
+`profile`, `train` and `predict` read the provided match -- `train` only to check its Smart Tagging
+against its tracking (config.TAGS_CHECK) -- so run them on your own machine: the terms forbid
 handing the match data, or extracts of it, to any hosted model.
 """
 
@@ -20,7 +22,7 @@ import tempfile
 
 import numpy as np
 
-from possession import config, dfl, guard, noise, pipeline
+from possession import config, guard, matches, noise, pipeline
 from possession.scoring import paired_spell_bootstrap, pm, score, validation_error, write_labels
 
 # Params
@@ -39,7 +41,7 @@ def load_games(ids):
     games = []
     for match_id in ids:
         pipeline.log("loading    {}".format(match_id))
-        games.append(dfl.load(match_id))
+        games.append(matches.load(match_id))
     return games
 
 
@@ -54,26 +56,68 @@ def profile_for(path):
 def cmd_download(args):
     for match_id in args.games:
         pipeline.log("download   {}".format(match_id))
-        dfl.download(match_id)
+        matches.download(match_id)
 
 
 def cmd_profile(args):
     from possession.tracking import load_atd
-    profile = noise.measure(load_atd())
+    profile = noise.measure(load_atd(broadcast=args.broadcast))
+    if args.broadcast:  # train and predict read the ATD as this profile measured it
+        profile["broadcast"] = True
     noise.save_profile(profile, args.out)
     print(json.dumps(profile, indent=2, sort_keys=True))
     print("-> {}".format(os.path.relpath(args.out, config.ROOT)))
 
 
+def tag_plan_for(games, profile):
+    """With config.TAGS_CHECK, the provided match's Smart Tagging checked against its tracking
+    (pipeline.tag_plan) -- it decides whether the model reads the tags. None without the match."""
+    if not config.TAGS_CHECK:
+        return None
+    from possession.tracking import load_atd
+    try:
+        match = load_atd(broadcast=bool(profile.get("broadcast")))
+    except IOError as problem:
+        pipeline.log("note       the provided match is not here, so its Smart Tagging cannot be "
+                     "checked: training the model without tags ({})".format(problem))
+        return {"use": False, "reason": "provided match not found"}
+    plan = pipeline.tag_plan(games, profile, match)
+    pipeline.log("tags       {}".format(pipeline.describe_tags(plan)))
+    return plan
+
+
 def cmd_train(args):
-    bundle = pipeline.train(load_games(args.games), profile_for(args.profile), quick=args.quick,
-                            tune_decoder=not args.no_tune)
+    games, profile = load_games(args.games), profile_for(args.profile)
+    bundle = pipeline.train(games, profile, quick=args.quick, tune_decoder=not args.no_tune,
+                            tags=tag_plan_for(games, profile))
+    bundle["broadcast"] = bool(profile.get("broadcast"))
+    if config.FLOW_WEIGHT > 0:
+        bundle["flow"] = pipeline.train_flow(games, profile, bundle["tags"], args.device)
     folder = os.path.dirname(args.out)
     if folder and not os.path.isdir(folder):
         os.makedirs(folder)
     pipeline.save(bundle, args.out)
     print("decoder {}".format(bundle["decoder"]))
+    print("tags    {}".format(pipeline.describe_tags(bundle["tags"])))
+    print("flow    {}".format(describe_flow(bundle)))
     print("-> {}".format(os.path.relpath(args.out, config.ROOT)))
+
+
+def describe_flow(bundle):
+    flow = bundle.get("flow")
+    return "blended at {}".format(flow["weight"]) if flow else "none"
+
+
+def cmd_train_flow(args):
+    """The flow model alone, added to a trained bundle: the mixture is kept as it is."""
+    bundle = pipeline.load(args.model)
+    games, profile = load_games(args.games), profile_for(args.profile)
+    plan = bundle.get("tags", {"use": config.USE_TAGS})
+    pipeline.log("tags       {}".format(pipeline.describe_tags(plan)))
+    bundle["flow"] = pipeline.train_flow(games, profile, plan, args.device)
+    pipeline.save(bundle, args.model)
+    print("flow    {}".format(describe_flow(bundle)))
+    print("-> {}".format(os.path.relpath(args.model, config.ROOT)))
 
 
 def cmd_predict(args):
@@ -81,7 +125,9 @@ def cmd_predict(args):
     from possession.tracking import load_atd
     n_frames = GAMES[GAME]["n_video_frames"]
 
-    codes = pipeline.predict(pipeline.load(args.model), load_atd())
+    bundle = pipeline.load(args.model)
+    uses = bundle.get("broadcast", False)  # as the profile the model was trained on was measured
+    codes = pipeline.predict(bundle, load_atd(broadcast=uses))
     write_labels(args.out, codes)
     problem = validation_error(args.out, n_frames)
     if problem:
@@ -92,19 +138,32 @@ def cmd_predict(args):
     counts = {letter: int(np.sum(codes == code)) for code, letter in enumerate(pm.LABELS)}
     print("valid  {} rows  H {H}  A {A}  D {D}  X {X}  possessions {n}".format(
         n_frames, n=len(spells), **counts))
+    plan = bundle.get("tags", {"use": config.USE_TAGS, "reason": "model made before the check"})
+    print("tags   {}".format(pipeline.describe_tags(plan)))
+    print("flow   {}".format(describe_flow(bundle)))
+    print("ball   {}".format("gaps filled from the broadcast" if uses else "tactical only"))
     print("sha256 {}".format(guard.file_digest(args.out)))
     print("-> {}".format(os.path.relpath(args.out, config.ROOT)))
 
     if args.check:
         # A second run from scratch -- model and data reloaded -- must give the same bytes
         # (RULES.md, rule 3).
-        again = pipeline.predict(pipeline.load(args.model), load_atd())
+        again = pipeline.predict(pipeline.load(args.model), load_atd(broadcast=uses))
         with tempfile.TemporaryDirectory() as folder:
             second = write_labels(os.path.join(folder, "again.csv"), again)
             same = guard.file_digest(second) == guard.file_digest(args.out)
         print("reproducible: {}".format("yes, identical bytes" if same else "NO -- runs differ"))
         if not same:
             sys.exit(1)
+
+
+def cmd_broadcast(args):
+    """The broadcast ball aligned to the tactical timeline: aggregate checks only, nothing written."""
+    from possession import broadcast
+    from possession.tracking import load_atd
+    tactical, other = load_atd(), broadcast.load()
+    pipeline.log("broadcast  {} frames at {} fps; aligning".format(other.n_frames, other.fps))
+    print(json.dumps(broadcast.describe(tactical, broadcast.align(tactical, other)), indent=2))
 
 
 def cmd_evaluate(args):
@@ -147,7 +206,8 @@ def cmd_evaluate(args):
     summary = os.path.join(args.report_dir, "summary.json")
     with open(summary, "w") as handle:
         json.dump([{"game": r["game"], "model": r["model"], "baseline": r["baseline"],
-                    "decoder": r["decoder"]} for r in results], handle, indent=2, default=float)
+                    "decoder": r["decoder"], "tags": r["tags"]} for r in results], handle,
+                  indent=2, default=float)
     print("-> {}  (per-game CSVs score with: python evaluation/run_evaluation.py --gt <gt.csv>)"
           .format(os.path.relpath(summary, config.ROOT)))
 
@@ -191,23 +251,38 @@ def main(argv=None):
                         help="cap model-fitting threads (0 = library default)")
     sub = parser.add_subparsers(dest="command")
     sub.required = True
-    all_games = sorted(dfl.MATCHES)
+    all_games, default_games = list(matches.ALL), list(matches.default())
 
-    command = sub.add_parser("download", help="fetch the open DFL matches")
+    command = sub.add_parser("download", help="fetch the open DFL matches and Metrica's samples")
     command.add_argument("--games", nargs="+", default=all_games, choices=all_games)
     command.set_defaults(func=cmd_download)
 
     command = sub.add_parser("profile", help="measure the provided ATD's missing-data statistics")
     command.add_argument("--out", default=config.DEFAULT_PROFILE)
+    command.add_argument("--broadcast", action="store_true",
+                         help="fill the ball's gaps from the broadcast first; train and predict follow")
     command.set_defaults(func=cmd_profile)
 
-    command = sub.add_parser("train", help="train experts, gate and decoder on DFL games")
-    command.add_argument("--games", nargs="+", default=all_games, choices=all_games)
+    command = sub.add_parser("broadcast", help="check the broadcast ball's alignment to tactical")
+    command.set_defaults(func=cmd_broadcast)
+
+    command = sub.add_parser("train", help="train experts, gate and decoder on labelled games")
+    command.add_argument("--games", nargs="+", default=default_games, choices=all_games)
     command.add_argument("--profile", default=config.DEFAULT_PROFILE)
     command.add_argument("--out", default=config.DEFAULT_MODEL)
     command.add_argument("--quick", action="store_true", help="fewer rows, copies and trees")
     command.add_argument("--no-tune", action="store_true", help="keep the default decoder")
+    command.add_argument("--device", choices=("mps", "cpu"),
+                         help="where the flow model trains (default: the GPU where there is one)")
     command.set_defaults(func=cmd_train)
+
+    command = sub.add_parser("train-flow", help="add the flow model to a trained bundle")
+    command.add_argument("--games", nargs="+", default=default_games, choices=all_games)
+    command.add_argument("--profile", default=config.DEFAULT_PROFILE)
+    command.add_argument("--model", default=config.DEFAULT_MODEL)
+    command.add_argument("--device", choices=("mps", "cpu"),
+                         help="where it trains (default: the GPU where there is one)")
+    command.set_defaults(func=cmd_train_flow)
 
     command = sub.add_parser("predict", help="write the submission for the provided match")
     command.add_argument("--model", default=config.DEFAULT_MODEL)
@@ -216,8 +291,8 @@ def main(argv=None):
                          help="run twice from scratch and require identical bytes")
     command.set_defaults(func=cmd_predict)
 
-    command = sub.add_parser("evaluate", help="leave-one-game-out score on DFL games")
-    command.add_argument("--games", nargs="+", default=all_games, choices=all_games)
+    command = sub.add_parser("evaluate", help="leave-one-game-out score on labelled games")
+    command.add_argument("--games", nargs="+", default=default_games, choices=all_games)
     command.add_argument("--holdout", nargs="+", choices=all_games,
                          help="only hold out these games (each still trains on all the others)")
     command.add_argument("--profile", default=config.DEFAULT_PROFILE)

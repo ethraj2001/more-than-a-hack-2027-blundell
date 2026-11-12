@@ -23,7 +23,8 @@ class Tracking(object):
     period   (T,)      int8      1, 2 ... for play; 0 for frames outside the match
     """
 
-    def __init__(self, name, players, team, ball, period, pitch, fps=config.FPS):
+    def __init__(self, name, players, team, ball, period, pitch, fps=config.FPS, tags=None,
+                 touches=None):
         self.name = name
         self.players = np.asarray(players, dtype=np.float32)
         self.team = np.asarray(team, dtype=np.int8)
@@ -31,6 +32,10 @@ class Tracking(object):
         self.period = np.asarray(period, dtype=np.int8)
         self.pitch = (float(pitch[0]), float(pitch[1]))
         self.fps = fps
+        self.tags = tags  # Smart Tagging intervals (tagging.py), or None
+        # (frames, teams) of known touches, for a source whose ball is too often lost to find them
+        # (metrica.py's events); None to read them off the ball (pipeline.touch_frames).
+        self.touches = touches
 
         n_frames, n_slots = self.players.shape[:2]
         if self.players.shape != (n_frames, n_slots, 2):
@@ -47,7 +52,8 @@ class Tracking(object):
     def replace(self, **changes):
         """A copy with some arrays swapped out. Used by the noise model."""
         fields = {"name": self.name, "players": self.players, "team": self.team,
-                  "ball": self.ball, "period": self.period, "pitch": self.pitch, "fps": self.fps}
+                  "ball": self.ball, "period": self.period, "pitch": self.pitch, "fps": self.fps,
+                  "tags": self.tags, "touches": self.touches}
         fields.update(changes)
         return Tracking(**fields)
 
@@ -65,8 +71,9 @@ def period_blocks(period):
 
 # -- the provided ATD --------------------------------------------------------------------------
 
-def load_atd(game=None, data_dir=None):
-    """The provided tactical ATD as a Tracking, periods taken from the published half blocks.
+def load_atd(game=None, data_dir=None, broadcast=False):
+    """The provided tactical ATD as a Tracking, periods taken from the published half blocks;
+    with broadcast, its ball's gaps filled from the broadcast recording (broadcast.py).
 
     The half blocks are the ones DATA.md publishes ("boundaries, not answers"): using them is
     what lets the pipeline write X before kickoff, at halftime and after the whistle.
@@ -74,8 +81,29 @@ def load_atd(game=None, data_dir=None):
     from games import GAME, GAMES, half_video_blocks, require, source_frames
     game = game or GAME
     meta_path, raw_path = require(["atd_meta", "atd_raw"], game, data_dir, "tactical")
-    return read_atd(meta_path, raw_path, n_frames=source_frames("tactical", game),
-                    pitch=GAMES[game]["pitch"], blocks=half_video_blocks(game), name=game)
+    tracking = read_atd(meta_path, raw_path, n_frames=source_frames("tactical", game),
+                        pitch=GAMES[game]["pitch"], blocks=half_video_blocks(game), name=game)
+    if broadcast:
+        from possession import broadcast as broadcast_ball
+        tracking = broadcast_ball.fused(tracking, game, data_dir)
+    if config.USE_TAGS or config.TAGS_CHECK:
+        tracking.tags = smart_tagging(game, data_dir, meta_path)
+    return tracking
+
+
+def smart_tagging(game, data_dir, meta_path):
+    """The provided game's Smart Tagging as tagging.read() intervals, its clubs matched to the
+    ATD's home and away teams; None if the bundle has no Smart Tagging file."""
+    from starter import load_smart_tagging
+    from starter.baseline import team_names
+    from possession import tagging
+    try:
+        path = load_smart_tagging.pattern_path(game, data_dir)
+    except IOError:
+        return None
+    guard.check_input(path)
+    home, away = team_names(meta_path)
+    return tagging.read(load_smart_tagging.load(game, data_dir), home or "", away or "")
 
 
 def read_atd(meta_path, raw_path, n_frames, pitch, blocks, name="atd"):
