@@ -295,7 +295,7 @@ The absolute level is the uncertain part.
 
 - **The provided match is harder than our validation games.** The published baseline scores
   0.31 on our noisy copies and 0.243 on the provided match. Our models agree with each other
-  less on it than on any held-out game (section 5), and the submitted model finds about 290
+  less on it than on any held-out game (section 5), and the submitted model finds 315
   possessions there against about 350 per game on held-out DFL games. We expect a lower score
   than the held-out 0.74.
 - **Label conventions.** The model learns DFL's notion of dead ball and ownership. The procedure
@@ -329,7 +329,14 @@ python -m possession predict --model models/moe_feat_tcn.pkl \
 python evaluation/validate_submission.py evaluation/results/Blundell.csv
 ```
 
-`predict --check` makes the file twice from scratch and requires identical bytes. The model file
+`predict --check` makes the file twice from scratch and requires identical bytes. The submitted
+file's SHA-256 is
+
+```
+bd695325f68da021258236ba0323b9f51d2be8b27c9fe46e85eafc89a9ec6434  Blundell.csv
+236c517d6d71966755d2b2c01dd74bbed0f6003a9f312698df3fa4d60074b71a  models/moe_feat_tcn.pkl
+```
+ The model file
 `models/moe_feat_tcn.pkl` is in the repository, and it is what regenerates the submission byte for
 byte: the flow model trains on a GPU, where a retrain is not bit-identical. `python -m possession
 evaluate --quick --jobs 7` gives the held-out scores, and `python -m pytest tests/ -q` runs the
