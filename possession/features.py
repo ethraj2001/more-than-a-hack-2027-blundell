@@ -47,10 +47,22 @@ SHARED_TRANSITION = ("all_spd_mean", "ball_vis", "margin")
 TEAM_SHORT = ("near", "d_ball", "n_r2", "touch", "reach", "acc_max", "acc_near") + FIT_TEAM
 SHARED_LOOSE = ("contest",)
 SHARED_SHORT = ("ball_speed", "ball_dspd", "ball_vis")
+# Duels (_duels) get the short windows too: a challenge is over in a second.
+DUEL_TEAM = ("approach", "opp_gap", "opp_close")
+DUEL_SHARED = ("duel_gap", "duel_close")
+# Marking (_marking) changes as a team's shape does, so it gets the long windows instead.
+MARK_TEAM = ("marked", "marked_ahead", "free_ahead")
+MARK_CHUNK = 4000        # frames at a time: the pairwise distances are (frames, players, players)
+# Passing lanes and turns (_lanes, _turns) are over in a second, so they get the short windows
+# too; the keeper's distance to the ball as well, his place and the box the long ones.
+LANE_TEAM = ("lane_gap", "lane_n", "lane_along")
+KEEPER_TEAM = ("gk_ball", "gk_depth", "own_box")
+TURN_TEAM = ("turn_fwd", "turn_back")
+BOX_DEPTH_M, BOX_HALF_WIDTH_M = 16.5, 20.16  # the penalty area
 DIFF_BASES = ("d_ball", "n_r2", "near", "cx_att", "fwd_vel", "q90", "sx", "spd_mean", "car_max",
               "car_sum", "touch", "since_touch", "until_touch", "reach", "reach10", "reach25",
               "acc_max", "acc_near", "tag_att", "tag_def", "tag_set", "gap_last", "gap_next"
-              ) + FIT_TEAM
+              ) + FIT_TEAM + DUEL_TEAM + MARK_TEAM + LANE_TEAM + KEEPER_TEAM + TURN_TEAM
 # Series added later by the carrier model (carrier.py), and the contexts they get.
 CARRIER_TEAM = ("car_max", "car_sum")
 CARRIER_SHARED = ("car_top",)
@@ -228,10 +240,30 @@ def _block(tracking, start, stop):
         shared["contest"] = np.where(ball_avail, both.astype(np.float64), np.nan)
         shared["contest_run"] = np.where(both, np.minimum(_run_lengths(both), config.CAP_FRAMES),
                                          0.0)
+    duel_team, duel_shared, mark_team = (), (), ()
+    if config.DUEL_FEATURES:
+        _duels(team, shared, players, ball, distance, tracking.team, fps)
+        duel_team, duel_shared = DUEL_TEAM, DUEL_SHARED
+    if config.MARK_FEATURES:
+        _marking(team, players, ball, tracking.team, directions, length, width)
+        mark_team = MARK_TEAM
+    lane_team, keeper_team, turn_team = (), (), ()
+    if config.LANE_FEATURES:
+        _lanes(team, players, raw_ball, ball_vis, tracking.team, fps)
+        lane_team = LANE_TEAM
+    if config.KEEPER_FEATURES:
+        _keepers(team, x, y, visible, ball, tracking.team, directions, length, width)
+        keeper_team = KEEPER_TEAM
+    if config.TURN_FEATURES:
+        _turns(team, x, visible, tracking.team, directions, fps)
+        turn_team = TURN_TEAM
 
-    out_team = [_contexts(team[k], TEAM_CONTEXT, TEAM_TRANSITION, TEAM_SHORT) for k in (0, 1)]
+    out_team = [_contexts(team[k], TEAM_CONTEXT + mark_team + keeper_team,
+                          TEAM_TRANSITION + mark_team + lane_team + turn_team,
+                          TEAM_SHORT + duel_team + lane_team + keeper_team[:1] + turn_team)
+                for k in (0, 1)]
     return out_team, _contexts(shared, SHARED_CONTEXT, SHARED_TRANSITION,
-                               SHARED_SHORT + SHARED_LOOSE)
+                               SHARED_SHORT + SHARED_LOOSE + duel_shared)
 
 
 def _touches(team, ball, fps):
@@ -346,6 +378,152 @@ def _dynamics(team, players, distance, slot_team, fps):
         rows = np.arange(len(reach))
         team[k]["acc_near"] = np.where(np.isfinite(reach[rows, nearest]),
                                        magnitude[rows, nearest], np.nan)
+
+
+def _duels(team, shared, players, ball, distance, slot_team, fps):
+    """Players running into each other. Per team: how fast its player nearest the ball runs at it
+    (m/s, > 0 towards it), how near the nearest opponent is to that player, and how fast the two
+    close on each other (m/s, > 0 closing). Shared: the gap and closing speed between the two
+    teams' players nearest the ball -- both running at the ball and at each other is a challenge."""
+    velocity = _centred_diff(players, config.DYNAMICS_HALF) * fps
+    velocity[np.hypot(velocity[..., 0], velocity[..., 1]) > config.MAX_PLAYER_SPEED] = np.nan
+    rows = np.arange(len(players))
+    nearest = []
+    for k in (0, 1):
+        reach = np.where((slot_team == k)[None, :] & ~np.isnan(distance), distance, np.inf)
+        i = np.argmin(reach, axis=1)
+        found = np.isfinite(reach[rows, i])[:, None]
+        p, v = np.where(found, players[rows, i], np.nan), np.where(found, velocity[rows, i], np.nan)
+        nearest.append((p, v))
+        to_ball = ball - p
+        team[k]["approach"] = np.sum(v * to_ball, axis=1) / np.maximum(np.hypot(*to_ball.T), 0.1)
+    for k in (0, 1):
+        p, v = nearest[k]
+        gaps = np.hypot(players[..., 0] - p[:, None, 0], players[..., 1] - p[:, None, 1])
+        gaps = np.where((slot_team == 1 - k)[None, :] & ~np.isnan(gaps), gaps, np.inf)
+        j = np.argmin(gaps, axis=1)
+        found = np.isfinite(gaps[rows, j])
+        team[k]["opp_gap"] = np.where(found, gaps[rows, j], np.nan)
+        team[k]["opp_close"] = np.where(found, _closing(p, v, players[rows, j], velocity[rows, j]),
+                                        np.nan)
+    (p0, v0), (p1, v1) = nearest
+    shared["duel_gap"] = np.hypot(*(p1 - p0).T)
+    shared["duel_close"] = _closing(p0, v0, p1, v1)
+
+
+def _marking(team, players, ball, slot_team, directions, length, width):
+    """Per team: the share of its players marked goal-side (an opponent within MARK_M, nearer the
+    goal the player attacks than he is), the share of those upfield of the ball, and the number
+    upfield of it with no opponent within MARK_M. A frame's visible tracks are gathered first, so
+    the pairwise distances stay small however many track slots the tracking has."""
+    n = len(players)
+    for k in (0, 1):
+        for key in MARK_TEAM:
+            team[k][key] = np.full(n, np.nan)
+    visible = ~np.isnan(players[..., 0])
+    for a in range(0, n, MARK_CHUNK):
+        b = min(n, a + MARK_CHUNK)
+        seen = visible[a:b]
+        m = max(int(seen.sum(axis=1).max()), 1)
+        order = np.argsort(~seen, axis=1, kind="stable")[:, :m]
+        pos = np.take_along_axis(players[a:b], order[..., None], axis=1)
+        side = np.where(np.take_along_axis(seen, order, axis=1), slot_team[order], -1)
+        gap = np.hypot(pos[:, :, None, 0] - pos[:, None, :, 0],
+                       pos[:, :, None, 1] - pos[:, None, :, 1])
+        for k in (0, 1):
+            goal = length if directions[k] > 0 else 0.0
+            to_goal = np.hypot(goal - pos[..., 0], width / 2.0 - pos[..., 1])
+            near = (side[:, None, :] == 1 - k) & (gap < config.MARK_M)
+            mine = side == k
+            marked = mine & np.any(near & (to_goal[:, None, :] < to_goal[:, :, None]), axis=2)
+            free = mine & ~np.any(near, axis=2)
+            x_att = pos[..., 0] if directions[k] > 0 else length - pos[..., 0]
+            ball_att = ball[a:b, 0] if directions[k] > 0 else length - ball[a:b, 0]
+            ahead = mine & (x_att > ball_att[:, None])
+            n_mine, n_ahead = mine.sum(axis=1), ahead.sum(axis=1)
+            f = team[k]
+            f["marked"][a:b] = np.where(n_mine > 0, marked.sum(axis=1) / np.maximum(n_mine, 1),
+                                        np.nan)
+            f["marked_ahead"][a:b] = np.where(n_ahead > 0, (marked & ahead).sum(axis=1)
+                                              / np.maximum(n_ahead, 1), np.nan)
+            f["free_ahead"][a:b] = np.where(np.isnan(ball_att), np.nan,
+                                            (free & ahead).sum(axis=1))
+
+
+def _lanes(team, players, raw_ball, seen, slot_team, fps):
+    """Per team, along the path the ball last travelled -- from its latest sighting, in the
+    direction its fitted velocity then had, wherever it moved faster than LANE_SPEED: the
+    smallest distance of one of its players from that path within LANE_M ahead (lane_gap, LANE_M
+    where none is ahead), how many of them are within LANE_W of it (lane_n), and how far along it
+    the first of those stands (lane_along, LANE_M where none is). NaN where there is no path."""
+    n = len(seen)
+    last, _ = _sightings(seen)
+    before, _ = _fitted_velocity(raw_ball, config.LANE_FIT)
+    i = np.clip(last, 0, n - 1)
+    origin, step = raw_ball[i], before[i]
+    size = np.hypot(*step.T)
+    moving = (last >= 0) & (size * fps > config.LANE_SPEED)
+    direction = step / np.where(moving, size, np.nan)[:, None]
+    rel = players - origin[:, None, :]
+    along = rel[..., 0] * direction[:, None, 0] + rel[..., 1] * direction[:, None, 1]
+    across = np.abs(rel[..., 0] * direction[:, None, 1] - rel[..., 1] * direction[:, None, 0])
+    ahead = (along > config.LANE_MIN_M) & (along < config.LANE_M)
+    for k in (0, 1):
+        mine = ahead & (slot_team == k)[None, :]
+        in_lane = mine & (across < config.LANE_W)
+        f = team[k]
+        f["lane_gap"] = np.where(moving, np.minimum(np.where(mine, across, np.inf).min(axis=1),
+                                                    config.LANE_M), np.nan)
+        f["lane_n"] = np.where(moving, in_lane.sum(axis=1), np.nan)
+        f["lane_along"] = np.where(moving, np.minimum(np.where(in_lane, along, np.inf).min(axis=1),
+                                                      config.LANE_M), np.nan)
+
+
+def _keepers(team, x, y, visible, ball, slot_team, directions, length, width):
+    """Per team, its deepest player -- the keeper in almost every frame: his distance to the ball
+    (gk_ball), how far he stands from his own goal line (gk_depth), and whether the ball is in
+    that team's penalty area (own_box)."""
+    rows = np.arange(len(x))
+    for k in (0, 1):
+        mine = visible & (slot_team == k)[None, :]
+        depth = np.where(mine, x if directions[k] > 0 else length - x, np.inf)
+        i = np.argmin(depth, axis=1)
+        found = np.isfinite(depth[rows, i])
+        keeper_x = np.where(found, x[rows, i], np.nan)
+        keeper_y = np.where(found, y[rows, i], np.nan)
+        ball_depth = ball[:, 0] if directions[k] > 0 else length - ball[:, 0]
+        inside = (ball_depth < BOX_DEPTH_M) & (np.abs(ball[:, 1] - width / 2.0) < BOX_HALF_WIDTH_M)
+        f = team[k]
+        f["gk_ball"] = np.hypot(keeper_x - ball[:, 0], keeper_y - ball[:, 1])
+        f["gk_depth"] = np.where(found, depth[rows, i], np.nan)
+        f["own_box"] = np.where(np.isnan(ball[:, 0]), np.nan, inside.astype(np.float64))
+
+
+def _turns(team, x, visible, slot_team, directions, fps):
+    """Per team, the share of its tracked players whose run along the pitch reverses within
+    TURN_HALF frames either side, faster than TURN_SPEED both ways: back towards their own goal,
+    then forward (turn_fwd, as a team that has just won the ball), or the other way round
+    (turn_back, as one that has just lost it)."""
+    half = config.TURN_HALF
+    before = (x - _shift(x, half)) * fps / half
+    after = (_shift(x, -half) - x) * fps / half
+    for k in (0, 1):
+        sign = 1.0 if directions[k] > 0 else -1.0
+        b, a = sign * before, sign * after
+        mine = (visible & (slot_team == k)[None, :] & (np.abs(b) < config.MAX_PLAYER_SPEED)
+                & (np.abs(a) < config.MAX_PLAYER_SPEED))
+        count = mine.sum(axis=1)
+        forward = mine & (b < -config.TURN_SPEED) & (a > config.TURN_SPEED)
+        back = mine & (b > config.TURN_SPEED) & (a < -config.TURN_SPEED)
+        team[k]["turn_fwd"] = np.where(count > 0, forward.sum(axis=1) / np.maximum(count, 1),
+                                       np.nan)
+        team[k]["turn_back"] = np.where(count > 0, back.sum(axis=1) / np.maximum(count, 1), np.nan)
+
+
+def _closing(p, v, q, w):
+    """(T,) how fast points p and q, moving at v and w, close on each other (> 0 closing)."""
+    line = q - p
+    return -np.sum((w - v) * line, axis=1) / np.maximum(np.hypot(*line.T), 0.1)
 
 
 def _reach(team, players, velocity, visible, slot_team, ball, fps):

@@ -36,10 +36,12 @@ BALL_BASES = {"d_ball", "d_ball2", "n_r2", "n_r5", "near", "bx_att", "ball_vis",
               "since_seen", "until_seen", "gap_len", "ball_speed", "ball_dv", "ball_dspd",
               "ball_turn", "margin", "margin_goal", "margin_touch", "car_max", "car_sum",
               "car_top", "touch", "since_touch", "until_touch", "reach", "reach10", "reach25",
-              "acc_near", "gap_last", "gap_next", "gap_disp", "contest", "contest_run"
+              "acc_near", "gap_last", "gap_next", "gap_disp", "contest", "contest_run",
+              "lane_gap", "lane_n", "lane_along", "gk_ball", "own_box"
               } | set(FIT_TEAM) | set(FIT_SHARED)
 SHAPE_BASES = {"cnt", "cx_att", "cy_abs", "sx", "sy", "q10", "q90", "spd_mean", "still",
-               "fwd_vel", "all_spd_mean", "all_still", "n_vis", "acc_max"}
+               "fwd_vel", "all_spd_mean", "all_still", "n_vis", "acc_max", "gk_depth", "turn_fwd",
+               "turn_back"}
 TAG_BASES = {"tag_att", "tag_def", "tag_set", "tag_unknown", "tag_any", "tag_agree_att",
              "tag_agree_def", "tag_agree_set"}
 SWAP_STATE = np.array([A, H, D])  # reorders [p_H, p_A, p_D] when the teams are swapped

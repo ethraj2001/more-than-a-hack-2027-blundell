@@ -35,7 +35,8 @@ import zlib
 import numpy as np
 import sklearn
 
-from possession import config, decoder, experts, features, matches, noise, tagging
+from possession import (config, decoder, dilated, experts, features, kickoff, matches, noise,
+                        rules, tagging)
 from possession.carrier import Carrier
 from possession.experts import SWAP_BOUNDARY, SWAP_STATE, SWAP_TEAMS, ExpertBank
 from possession.features import _shift
@@ -504,6 +505,13 @@ def _train(games, profile, quick, tune_decoder, banks, first):
             sorted(config.DECODER_GRID), len(cases)))
         params, decoder_score, _ = decoder.tune(cases, log_pi)
         log("decoder    best {} -> out-of-fold objective {:.4f}".format(params, decoder_score))
+        params = dict(params, **config.DECODER_FIXED)
+    stage = None
+    if config.DILATED_STAGE:
+        if not tune_decoder:
+            raise ValueError("config.DILATED_STAGE is fitted on the decoder's out-of-fold cases")
+        log("dilated    second stage on {} out-of-fold games".format(len(cases)))
+        stage = dilated.fit(cases, seed=config.SEED)
 
     log("final      experts and gate on all {} games".format(len(games)))
     bank = fit_bank(run, tables, range(len(games)), names, banks)
@@ -513,6 +521,7 @@ def _train(games, profile, quick, tune_decoder, banks, first):
     log("done       in {:.0f} min".format((time.time() - started) / 60.0))
     return {
         "bank": bank, "gate": gate, "refiner": refiner, "carrier": final_carrier,
+        "dilated": stage,
         "decoder": params,
         "log_pi": log_pi,
         "train_games": [t.name for t, _ in games], "profile": profile, "run": run,
@@ -529,8 +538,14 @@ def save(bundle, path):
 
 
 def load(path):
+    """A saved bundle, with the config values it was trained under (train --set) applied, so that
+    predicting with it computes the features it was trained on."""
     with open(path, "rb") as handle:
-        return pickle.load(handle)
+        bundle = pickle.load(handle)
+    if isinstance(bundle, dict):  # BankCache loads its expert banks through here too
+        for key, value in bundle.get("config", {}).items():
+            setattr(config, key, value)
+    return bundle
 
 
 # -- the flow model --------------------------------------------------------------------------------
@@ -575,10 +590,13 @@ def flow_probs(model, tracking):
     the mixture reads."""
     from possession import flow
     feature_set = compute_features(tracking)
-    if feature_set.names() != model["names"]:
+    # The mixture may read feature families added since the flow was trained: the flow keeps to
+    # its own columns, which the added ones leave as they were.
+    if not set(model["names"]) <= set(feature_set.names()):
         raise ValueError("the flow model was trained on other features -- train it again")
     net = flow.restore(model["weights"], len(model["names"]))
-    return flow.first_round(net, feature_set.matrix((0, 1)).astype(np.float16),
+    matrix = feature_set.matrix((0, 1), names=model["names"]).astype(np.float16)
+    return flow.first_round(net, matrix,
                             flow.swap_columns(model["names"]), model["scale"])
 
 
@@ -589,6 +607,21 @@ def predict(bundle, tracking):
     read Smart Tagging reads the match's tags as the plan says -- once check() has confirmed they
     are the tags the plan was made from. A bundle with a flow model blends its P(H, A, D) with the
     gate's, the flow's share its "weight"."""
+    probs, boundary = predict_probs(bundle, tracking)
+    if config.POSSESSION_RULES:
+        probs = rules.apply(probs, tracking)
+    if config.KICKOFF_DEAD:
+        probs = kickoff.hold_dead(probs, tracking)
+    return decode(bundle, probs, boundary, tracking.period)
+
+
+def decode(bundle, probs, boundary, period):
+    params = dict(bundle["decoder"], **config.DECODER_FIXED)
+    return decoder.decode(probs, boundary, period, params, bundle["log_pi"])
+
+
+def predict_probs(bundle, tracking):
+    """(P(H, A, D) (T, 3), boundary (T,)): what predict decodes."""
     plan = bundle.get("tags", {"use": config.USE_TAGS})
     if plan["use"] and "groups" in plan:
         if tracking.tags is None:
@@ -602,12 +635,14 @@ def predict(bundle, tracking):
         outputs = expert_outputs(bundle["bank"], tracking, bundle.get("carrier"))
         probs, boundary = chain_probs(bundle["gate"], bundle["bank"], outputs,
                                       bundle.get("refiner"))
+        if bundle.get("dilated"):
+            probs = dilated.refine(bundle["dilated"], probs, boundary, tracking.period)
         if bundle.get("flow"):
             weight = bundle["flow"]["weight"]
             temperature = bundle["flow"].get("temperature", config.FLOW_TEMPERATURE)
             probs = (1 - weight) * probs + weight * sharpen(flow_probs(bundle["flow"], tracking),
                                                             temperature)
-    return decoder.decode(probs, boundary, tracking.period, bundle["decoder"], bundle["log_pi"])
+    return probs, boundary
 
 
 def baseline(tracking, window=50):

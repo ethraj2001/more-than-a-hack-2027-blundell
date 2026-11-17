@@ -50,6 +50,26 @@ def decode(probs, boundary, period, params, log_pi):
     return out
 
 
+def absorb_flicks(codes, period, frames):
+    """codes with each possession shorter than frames that interrupts the other team's -- between
+    two of its possessions, or between one and a stoppage -- given to that team: a touch without
+    control, or a deflection, is not a change of possession (CHALLENGE.md)."""
+    out = codes.copy()
+    if frames <= 0:
+        return out
+    for start, stop, _ in period_blocks(period):
+        block = out[start:stop]
+        edges = np.flatnonzero(np.diff(block)) + 1
+        bounds = np.concatenate(([0], edges, [len(block)]))
+        for i in range(1, len(bounds) - 2):
+            a, b = bounds[i], bounds[i + 1]
+            before, label, after = block[bounds[i - 1]], block[a], block[b]
+            if (label in (H, A) and before in (H, A) and before != label and b - a < frames
+                    and after in (before, D)):
+                block[a:b] = before
+    return out
+
+
 def viterbi(probs, boundary, params, log_pi):
     n = len(probs)
     lengths = [max(2, int(params["min_possession"]))] * 2 + [max(2, int(params["min_dead"]))]

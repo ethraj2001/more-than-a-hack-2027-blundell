@@ -290,13 +290,41 @@ def corrupt(tracking, profile, rng, dead=None):
         crowd = _crowding(tracking.players[start:stop], tracking.ball[start:stop])
         segment[_ball_lost(seen, None if dead is None else dead[start:stop], crowd, profile,
                            gap_mean, rng)] = np.nan
+        if any(config.OCCLUSION_RATES):
+            near = _near(tracking.players[start:stop], tracking.ball[start:stop])
+            segment[_occlusions(~np.isnan(segment[:, 0]), near, rng)] = np.nan
         if paths is not None:
             _flickers(segment, tracking.players[start:stop], flicker, rng)
     ball += rng.normal(0.0, jitter["ball"], ball.shape).astype(np.float32)
     if config.BALL_DRIFT_M > 0:
         ball += _drift(len(ball), tracking.fps, rng)
 
+    if config.TEAM_SWITCH_RATE > 0:  # drawn last, so the rest of the copy is as it was without
+        players, team = _misfiled(players, tracking.team, config.TEAM_SWITCH_RATE, rng)
+        return tracking.replace(players=players, ball=ball, team=team)
     return tracking.replace(players=players, ball=ball)
+
+
+def _misfiled(players, team, rate, rng):
+    """Identity switches that cross the teams: each tracklet (a slot's run of visible frames) is,
+    with chance rate, filed under the other team -- moved to a slot of its own on that side. A
+    switch inside a team changes no feature, so only these are made."""
+    moved, sides = [], []
+    players = players.copy()
+    for slot in range(players.shape[1]):
+        seen = ~np.isnan(players[:, slot, 0])
+        edges = np.flatnonzero(np.diff(np.concatenate(([0], seen.astype(np.int8), [0]))))
+        for first, stop in zip(edges[::2], edges[1::2]):
+            if rng.random() < rate:
+                track = np.full((len(players), 2), np.nan, dtype=players.dtype)
+                track[first:stop] = players[first:stop, slot]
+                players[first:stop, slot] = np.nan
+                moved.append(track)
+                sides.append(1 - int(team[slot]))
+    if not moved:
+        return players, team
+    return (np.concatenate([players, np.stack(moved, axis=1)], axis=1),
+            np.concatenate([team, np.asarray(sides, dtype=team.dtype)]))
 
 
 def jittered(tracking, profile, rng):
@@ -455,6 +483,25 @@ def _crowding(players, ball):
     with np.errstate(invalid="ignore"):
         near = (distance < CROWD_RADIUS).sum(axis=1)
     return np.minimum(near, 4) / 4.0
+
+
+def _near(players, ball):
+    """Per frame, the players within CROWD_RADIUS of the true ball."""
+    distance = np.hypot(players[..., 0] - ball[:, None, 0], players[..., 1] - ball[:, None, 1])
+    with np.errstate(invalid="ignore"):
+        return (distance < CROWD_RADIUS).sum(axis=1)
+
+
+def _occlusions(seen, near, rng):
+    """Boolean per frame, True where a short loss hides the ball: after each seen frame, one
+    starts with config.OCCLUSION_RATES' chance for 1, 2 or 3+ players near, and lasts a geometric
+    number of frames, mean config.OCCLUSION_MEAN."""
+    rate = np.r_[0.0, config.OCCLUSION_RATES][np.minimum(near, 3)]
+    lost = np.zeros(len(seen), dtype=bool)
+    starts = np.flatnonzero(seen & (rng.random(len(seen)) < rate))
+    for t, length in zip(starts, rng.geometric(1.0 / config.OCCLUSION_MEAN, len(starts))):
+        lost[t + 1:t + 1 + length] = True
+    return lost
 
 
 def _stoppage_losses(dead, rng):

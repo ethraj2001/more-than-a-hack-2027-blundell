@@ -1,0 +1,11 @@
+# The versions the submission was made with (python 3.13). Rule 3: byte-identical regeneration.
+joblib==1.5.3
+matplotlib==3.10.5
+numpy==2.3.2
+pandas==2.3.2
+pillow==11.3.0
+pytest==8.3.5
+scikit-learn==1.8.0
+scipy==1.16.1
+threadpoolctl==3.6.0
+torch==2.8.0

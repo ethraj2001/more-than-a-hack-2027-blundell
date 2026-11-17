@@ -5,6 +5,7 @@
     python -m possession train                          # -> models/moe.pkl, flow model included
     python -m possession train-flow                     # add the flow model to models/moe.pkl
     python -m possession predict --check                # -> evaluation/results/moe.csv, twice
+    python -m possession diagnose                       # the match against the training copies
     python -m possession evaluate --quick --jobs 4      # leave-one-game-out on DFL -> reports/
     python -m possession compare reports/a reports/b    # paired difference between two versions
 
@@ -86,11 +87,28 @@ def tag_plan_for(games, profile):
     return plan
 
 
+def settings_from(pairs):
+    """{KEY: value} from train --set KEY=VALUE, each value read as JSON (true, 0.5, [1, 2]), each
+    key an existing config value."""
+    out = {}
+    for pair in pairs:
+        key, _, text = pair.partition("=")
+        if not hasattr(config, key):
+            raise SystemExit("--set: config has no {}".format(key))
+        out[key] = json.loads(text)
+    return out
+
+
 def cmd_train(args):
+    settings = settings_from(args.set)
+    for key, value in settings.items():
+        setattr(config, key, value)
+        pipeline.log("config     {} = {}".format(key, json.dumps(value)))
     games, profile = load_games(args.games), profile_for(args.profile)
     bundle = pipeline.train(games, profile, quick=args.quick, tune_decoder=not args.no_tune,
                             tags=tag_plan_for(games, profile))
     bundle["broadcast"] = bool(profile.get("broadcast"))
+    bundle["config"] = settings  # applied again whenever the bundle is loaded (pipeline.load)
     if config.FLOW_WEIGHT > 0:
         bundle["flow"] = pipeline.train_flow(games, profile, bundle["tags"], args.device)
     folder = os.path.dirname(args.out)
@@ -155,6 +173,16 @@ def cmd_predict(args):
         print("reproducible: {}".format("yes, identical bytes" if same else "NO -- runs differ"))
         if not same:
             sys.exit(1)
+
+
+def cmd_diagnose(args):
+    """The provided match beside the DFL games' held-out copies (diagnose.py): aggregates only."""
+    from possession import diagnose
+    from possession.tracking import load_atd
+    bundle = pipeline.load(args.model)
+    match = load_atd(broadcast=bundle.get("broadcast", False))
+    games = load_games(args.games)  # those `train` learns from, by default
+    print(diagnose.dumps(diagnose.report(bundle, match, games, profile_for(args.profile))))
 
 
 def cmd_broadcast(args):
@@ -266,12 +294,22 @@ def main(argv=None):
     command = sub.add_parser("broadcast", help="check the broadcast ball's alignment to tactical")
     command.set_defaults(func=cmd_broadcast)
 
+    command = sub.add_parser("diagnose", help="how the provided match differs from the training "
+                                              "copies: aggregate checks only, nothing written")
+    command.add_argument("--games", nargs="+", default=default_games, choices=all_games)
+    command.add_argument("--profile", default=config.DEFAULT_PROFILE)
+    command.add_argument("--model", default=config.DEFAULT_MODEL)
+    command.set_defaults(func=cmd_diagnose)
+
     command = sub.add_parser("train", help="train experts, gate and decoder on labelled games")
     command.add_argument("--games", nargs="+", default=default_games, choices=all_games)
     command.add_argument("--profile", default=config.DEFAULT_PROFILE)
     command.add_argument("--out", default=config.DEFAULT_MODEL)
     command.add_argument("--quick", action="store_true", help="fewer rows, copies and trees")
     command.add_argument("--no-tune", action="store_true", help="keep the default decoder")
+    command.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                         help="a config value for this model, remembered in it, e.g. "
+                              "LANE_FEATURES=true")
     command.add_argument("--device", choices=("mps", "cpu"),
                          help="where the flow model trains (default: the GPU where there is one)")
     command.set_defaults(func=cmd_train)

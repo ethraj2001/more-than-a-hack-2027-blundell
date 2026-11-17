@@ -101,6 +101,51 @@ REACH_FEATURES = False
 REACH_AHEAD = (10, 25)   # frames: 0.4 s and 1 s
 REACH_REACTION = 0.7     # seconds
 REACH_SPEED = 5.0        # m/s
+# Duels: players running into each other. Per team, how fast its player nearest the ball runs at
+# it, how near the nearest opponent is to that player and how fast the two close on each other;
+# shared, the gap and closing speed between the two teams' players nearest the ball. Velocities
+# over DYNAMICS_HALF frames either side, so that tracking jitter does not read as a run. Off: both
+# models trained with them, seven DFL games +0.004 (-0.002 to +0.010), better on 4 of 7; Metrica's
+# three -0.015 (-0.026 to -0.003), 0 of 3.
+DUEL_FEATURES = False
+# Marking off the ball: a player is marked when an opponent within MARK_M of him stands nearer the
+# goal he attacks than he does -- goal-side, as a defender marks. Per team, the share of its
+# players marked, the same over those upfield of the ball, and how many of those have no
+# opponent within MARK_M at all: free to receive a pass forward. Off: both models trained with
+# them, seven DFL games -0.001 (-0.007 to +0.004), better on 4 of 7; Metrica's three -0.002
+# (-0.012 to +0.008), 1 of 3.
+MARK_FEATURES = False
+MARK_M = 3.0             # metres
+# Passing lanes: along the path the ball last travelled -- from its latest sighting, in the
+# direction its velocity fitted over LANE_FIT frames then had, wherever it moved faster than
+# LANE_SPEED -- per team, how near its nearest player stands to that path within LANE_M ahead,
+# how many of its players are within LANE_W of it, and how far along the first of those is: who
+# the ball is heading for, read from its last known path even after the tracking loses it.
+LANE_FEATURES = False
+LANE_FIT = 6             # frames, as FIT_HALVES
+LANE_SPEED = 3.0         # m/s
+LANE_MIN_M = 1.0         # metres ahead of the ball, so the player who just played it is not counted
+LANE_M = 30.0            # metres
+LANE_W = 2.0             # metres
+# Keepers: per team, its deepest player -- the keeper in almost every frame -- his distance to the
+# ball and to his own goal line, and whether the ball is inside that team's penalty area.
+KEEPER_FEATURES = False
+# Turns: per team, the share of its players whose run along the pitch reverses, faster than
+# TURN_SPEED either side, over TURN_HALF frames before and after: back then forward, as a team
+# that has just won the ball does, or forward then back, as one that has just lost it.
+TURN_FEATURES = False
+TURN_HALF = 12           # frames
+TURN_SPEED = 1.0         # m/s
+
+# Kick-offs (kickoff.py): a period's tracking can start before its kick-off -- the provided match's
+# second half is graded from 110,808 but kicks off at 113,742, and those frames are D (FAQ.md) --
+# while every training game starts at its kick-off. Found from the tracking alone (both teams
+# lined up in their own halves, no live play before), the frames before it are held dead before
+# decoding. On the seven DFL games it finds nothing, so it changes nothing; on Metrica's three it
+# finds the 2-35 s before five of their six kick-offs, where the model already said D; with 30,
+# 60 or 120 s of walking out added before DFL second halves, it never lands after the true
+# kick-off (0.0-0.5 s on three games, 6-68 s early on four, the rest left to the model).
+KICKOFF_DEAD = True
 
 # -- training ----------------------------------------------------------------------------------
 
@@ -222,6 +267,9 @@ METRICA_GAMES = False
 # interval +0.008 to +0.025), better on 6 of 7; on Metrica's three games, whose own tracking does,
 # from DFL training alone, +0.070 (+0.053 to +0.089), 0.659 to 0.729, better on 3 of 3. If the
 # ATD kept the ball through stoppages after all, -0.026 (-0.035 to -0.017).
+# 0.6 instead, the mixture alone: -0.043 (-0.054 to -0.032) on held-out copies at 0.9, 0 of 7;
+# -0.006 (-0.014 to +0.001) on copies at 0.5, where the production mixture drops from 0.733 to
+# 0.687; Metrica's own tracking -0.007 (-0.022 to +0.008).
 DEAD_BALL_LOSS = 0.9
 DEAD_BALL_EDGE = 25
 # The share of live-play frames whose ball is lost, on labelled games; None: whatever the
@@ -258,6 +306,19 @@ LIVE_BALL_FIT = False
 # 1.0 m is worse than 0.5 on both: -0.027 (-0.035 to -0.020) without drift, -0.010 (-0.018 to
 # -0.003) with. 0 turns it off.
 BALL_DRIFT_M = 0.5
+# Short ball losses where players crowd it (noise._occlusions), on top of the others: after a seen
+# frame with 1, 2 or 3+ players within noise.CROWD_RADIUS of the ball, the chance one starts; its
+# length geometric, mean OCCLUSION_MEAN frames. `diagnose` on the provided ATD (positions only):
+# gaps start per 1,000 seen frames at 1.35, 1.40, 2.40 and 4.12 with 0, 1, 2 and 3+ players near;
+# on the DFL games' held-out copies at 1.75, 0.89, 1.26 and 1.53 -- the copies lose the ball as
+# readily in space as in a duel, the ATD twice as readily near players. The rates are the
+# differences: the copies then read 1.73, 1.34, 2.73 and 4.10. Seven DFL games held out, the blend
+# with both models trained on them: on copies with them -0.007 (-0.013 to +0.000), 2 of 7; on
+# copies without -0.009 (-0.015 to -0.003); Metrica's own tracking -0.007 (-0.018 to +0.004). The
+# production blend loses 0.012 to them, and training on them does not win it back. So off; for
+# held-out copies that look like the provided ATD, set them there alone.
+OCCLUSION_RATES = (0.0, 0.0, 0.0)
+OCCLUSION_MEAN = 40
 BALL_DRIFT_HZ = 0.2
 # A tracker that smooths its output spreads every sharp change of velocity -- a kick, a touch --
 # over several frames. `profile` measures how sharp the provided ATD's accelerations are when read
@@ -348,6 +409,37 @@ DECODER_GRID = {
     "min_dead": (10,),
     "switch_penalty": (0.0, 2.0, 4.0),
 }
+# A second stage with a TCN's receptive field (dilated.py): trees that read the gate's output at
+# dilated offsets out to +-128 frames and give P(H, A, D) again, before the flow model is blended
+# in. Blended and decoded as `predict` does: seven DFL games +0.004 (+0.001 to +0.007), better on
+# 5 of 7; Metrica's three -0.001 (-0.004 to +0.002), better on 1 of 3. Off by default: no gain on
+# Metrica's real tracking. The submitted model turns it on (build_submission.py).
+DILATED_STAGE = False
+# Identity switches across the teams in the training copies (noise._misfiled): the share of
+# tracklets filed under the other team. The provided ATD has more than eleven tracks on a team on
+# 12.9% of frames (profile: team_overfull_frac); within a team a switch changes no feature.
+TEAM_SWITCH_RATE = 0.0
+# The team's written possession rules that can sit on top of the model (rules.py): a duel moves
+# the H/A split toward the nearer team, and in a ball-tracking gap the ball is dead only with slow
+# players or a line crossing. Applied to the blend before the decoder. Held out: seven DFL games
+# -0.001 (-0.002 to +0.001), Metrica's three -0.002 (-0.006 to +0.002). Off by default: no gain is
+# shown. The submitted model turns it on (build_submission.py).
+POSSESSION_RULES = False
+# Settings that replace the searched ones, after the search and in every decode (a model trained
+# before them takes them at `predict`). Every held-out fold's search had picked a minimum
+# possession of 15 frames; decoding the production blend's held-out output with 10 instead, the
+# rest as each fold chose: seven DFL games -0.000 (-0.001 to +0.001), better on 2 of 7; Metrica's
+# three +0.002 (-0.001 to +0.005), better on 3 of 3, whose games have more short possessions (7.6%
+# under 15 frames to DFL's 5.9%). 12 decodes as 10; 20 is worse, DFL -0.002 (-0.005 to -0.000),
+# 0 of 7.
+# 4 is the team's choice, not a measured gain: a brief H A H or H A A H is one long possession of
+# H by the challenge's definition, and anything of 4 frames or more may stand as its own. Against
+# 10 on the same held-out output: 3 frames, DFL -0.012 (-0.014 to -0.009), 0 of 7, Metrica -0.013
+# (-0.016 to -0.010), 0 of 3; 4 frames, DFL -0.004 (-0.005 to -0.002), 1 of 7, Metrica -0.003
+# (-0.005 to -0.001), 0 of 3; 5 frames, DFL -0.001 (-0.002 to +0.000), Metrica -0.001 (-0.003 to
+# +0.000). On the provided match the blend gives 291 possessions at 3 frames, 289 at 4 and 5, 287
+# at 10 and 15.
+DECODER_FIXED = {"min_possession": 4}
 
 # -- noise -------------------------------------------------------------------------------------
 

@@ -8,6 +8,7 @@ parts connect, that the output is deterministic, and that the decoder beats the 
 smoothing on the same inputs.
 """
 
+import json
 import os
 import sys
 
@@ -18,11 +19,11 @@ from threadpoolctl import threadpool_limits
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from possession import (broadcast, carrier, config, decoder, dfl, features, guard,  # noqa
-                        metrica, noise,
+                        kickoff, metrica, noise,
                         pipeline,
                         scoring, synthetic, tagging)
 from possession.scoring import A, D, H, X, spell_f1  # noqa: E402
-from possession.tracking import period_blocks, read_atd  # noqa: E402
+from possession.tracking import Tracking, period_blocks, read_atd  # noqa: E402
 
 
 def test_guard_refuses_ground_truth(tmp_path):
@@ -93,7 +94,8 @@ def test_rolling_mean_matches_naive():
 def test_features_are_team_symmetric(optional, monkeypatch):
     if optional:  # every feature family that is off by default, on
         for flag in ("REACH_FEATURES", "DYNAMICS_FEATURES", "GAP_FEATURES", "CONTEST_FEATURES",
-                     "FIT_FEATURES"):
+                     "FIT_FEATURES", "DUEL_FEATURES", "MARK_FEATURES", "LANE_FEATURES",
+                     "KEEPER_FEATURES", "TURN_FEATURES"):
             monkeypatch.setattr(config, flag, True)
     tracking, _ = synthetic.match("sym", n_half=600, seed=1)
     tracking = noise.corrupt(tracking, dict(config.DEFAULT_NOISE), np.random.default_rng(1))
@@ -109,6 +111,114 @@ def test_features_are_team_symmetric(optional, monkeypatch):
         else:
             continue
         assert np.allclose(ab[:, j], mirror, equal_nan=True), name
+
+
+def test_duels_read_two_players_running_at_each_other():
+    # one player of each team, 20 m apart, each running at 5 m/s at the ball between them
+    t = np.arange(40, dtype=np.float64)
+    players = np.zeros((40, 2, 2))
+    players[:, 0, 0], players[:, 1, 0] = 40 + 0.2 * t, 60 - 0.2 * t
+    ball = np.tile([50.0, 0.0], (40, 1))
+    distance = np.hypot(players[..., 0] - ball[:, None, 0], players[..., 1] - ball[:, None, 1])
+    team, shared = [{}, {}], {}
+    features._duels(team, shared, players, ball, distance, np.array([0, 1]), 25.0)
+    inner = slice(config.DYNAMICS_HALF, 40 - config.DYNAMICS_HALF)
+    for k in (0, 1):
+        assert np.allclose(team[k]["approach"][inner], 5.0)
+        assert np.allclose(team[k]["opp_close"][inner], 10.0)
+        assert np.allclose(team[k]["opp_gap"], 20 - 0.4 * t)
+    assert np.allclose(shared["duel_close"][inner], 10.0)
+    assert np.allclose(shared["duel_gap"], 20 - 0.4 * t)
+    assert np.all(np.isnan(shared["duel_close"][:config.DYNAMICS_HALF]))
+
+
+def test_marking_reads_goal_side_defenders():
+    # team 0 attacks x = 100; its forward at x = 80 with a defender 2 m goal-side of him (frame 0),
+    # then 2 m behind him (frame 1); its other player at x = 40 has nobody near; the ball at x = 50
+    players = np.full((2, 3, 2), 34.0)
+    players[:, 0, 0], players[:, 1, 0] = 80.0, 40.0
+    players[:, 2, 0] = (82.0, 78.0)
+    ball = np.array([[50.0, 34.0], [50.0, 34.0]])
+    team = [{}, {}]
+    features._marking(team, players, ball, np.array([0, 0, 1]), (1, -1), 100.0, 68.0)
+    assert team[0]["marked"].tolist() == [0.5, 0.0]
+    assert team[0]["marked_ahead"].tolist() == [1.0, 0.0]
+    assert team[0]["free_ahead"].tolist() == [0.0, 0.0]  # the defender is within 3 m either way
+    # goal-side is mutual: each of the pair stands nearer his own goal than the other does
+    assert team[1]["marked"].tolist() == [1.0, 0.0]
+
+
+def test_lanes_read_who_the_ball_is_heading_for():
+    # the ball rolls along y = 34 at 10 m/s from x = 10; team 0's player stands on its path 15 m
+    # ahead, team 1's 6 m off it; after frame 20 the tracking loses the ball
+    n = 40
+    raw_ball = np.column_stack((10 + 0.4 * np.arange(n), np.full(n, 34.0)))
+    raw_ball[20:] = np.nan
+    players = np.zeros((n, 2, 2))
+    players[:, 0] = (35.0, 34.5)
+    players[:, 1] = (30.0, 40.0)
+    team = [{}, {}]
+    features._lanes(team, players, raw_ball, ~np.isnan(raw_ball[:, 0]), np.array([0, 1]), 25.0)
+    f = 15  # seen, the path known
+    assert np.isclose(team[0]["lane_gap"][f], 0.5) and team[0]["lane_n"][f] == 1
+    assert np.isclose(team[0]["lane_along"][f], 35.0 - raw_ball[f, 0])
+    assert np.isclose(team[1]["lane_gap"][f], 6.0) and team[1]["lane_n"][f] == 0
+    assert team[1]["lane_along"][f] == config.LANE_M
+    # lost: read from the last sighting, frame 19
+    assert np.isclose(team[0]["lane_along"][30], 35.0 - raw_ball[19, 0])
+    assert np.all(np.isnan(team[0]["lane_gap"][:2]))  # too few sightings to fit a velocity
+
+
+def test_keepers_read_the_deepest_player_and_the_box():
+    # team 0 defends x = 0: its keeper at x = 2, a defender at x = 20; team 1's keeper at x = 103
+    x = np.array([[2.0, 20.0, 103.0], [2.0, 20.0, 103.0]])
+    y = np.full((2, 3), 34.0)
+    ball = np.array([[10.0, 34.0], [60.0, 34.0]])
+    team = [{}, {}]
+    features._keepers(team, x, y, ~np.isnan(x), ball, np.array([0, 0, 1]), (1, -1), 105.0, 68.0)
+    assert team[0]["gk_ball"].tolist() == [8.0, 58.0]
+    assert team[0]["gk_depth"].tolist() == [2.0, 2.0]
+    assert team[0]["own_box"].tolist() == [1.0, 0.0]
+    assert team[1]["gk_depth"].tolist() == [2.0, 2.0]
+    assert team[1]["own_box"].tolist() == [0.0, 0.0]
+
+
+def test_turns_read_a_team_reversing():
+    # team 0 attacks x = 105: its two players run back at 4 m/s, then forward at 4 m/s from frame 50
+    n, h = 100, config.TURN_HALF
+    t = np.arange(n, dtype=np.float64)
+    run = np.where(t < 50, 60 - 0.16 * t, 52 + 0.16 * (t - 50))
+    x = np.column_stack((run, run - 10, np.full(n, 30.0)))
+    team = [{}, {}]
+    features._turns(team, x, ~np.isnan(x), np.array([0, 0, 1]), (1, -1), 25.0)
+    assert team[0]["turn_fwd"][50] == 1.0 and team[0]["turn_back"][50] == 0.0
+    assert team[0]["turn_fwd"][20] == 0.0 and team[0]["turn_fwd"][80] == 0.0
+    assert team[1]["turn_fwd"][50] == 0.0  # standing still
+    assert np.isnan(team[0]["turn_fwd"][h - 1])
+
+
+def _lined_up(n, run_first=0):
+    """20 players standing in their own halves (team 0 defends x = 0); team 0 sets off forward at
+    7.5 m/s from frame 200, and with run_first > 0 everyone first runs up and down at 5 m/s, live."""
+    rng = np.random.default_rng(0)
+    players = np.zeros((n, 20, 2))
+    players[:, :10, 0] = rng.uniform(10, 45, 10)
+    players[:, 10:, 0] = rng.uniform(60, 95, 10)
+    players[..., 1] = rng.uniform(5, 63, 20)
+    players[200:, :10, 0] += 0.3 * np.arange(1, n - 199)[:, None]
+    if run_first:
+        players[:run_first, :, 0] += 3.0 * np.sin(np.arange(run_first) / 15.0)[:, None]
+    team = np.array([0] * 10 + [1] * 10, dtype=np.int8)
+    return Tracking("lined", players, team, np.full((n, 2), np.nan), np.ones(n, np.int8),
+                    (105.3, 68.0))
+
+
+def test_kickoff_found_where_a_line_up_breaks():
+    found = kickoff.detect(_lined_up(400))
+    assert len(found) == 1 and found[0][0] == 0 and 200 <= found[0][1] <= 240
+    probs = kickoff.hold_dead(np.full((400, 3), 1 / 3.0), _lined_up(400))
+    assert np.all(probs[:200].argmax(axis=1) == D) and np.allclose(probs[300], 1 / 3.0)
+    assert kickoff.detect(_lined_up(400, run_first=150)) == []  # live play first: not a kick-off
 
 
 def test_fitted_velocity_recovers_a_kick_through_jitter():
@@ -737,6 +847,44 @@ def test_flow_model_blends_reproducibly_and_weight_zero_is_the_mixture(monkeypat
     sharp = pipeline.sharpen(p, 0.5)
     assert np.allclose(sharp.sum(axis=1), 1) and np.array_equal(sharp.argmax(axis=1), p.argmax(axis=1))
     assert (sharp.max(axis=1) >= p.max(axis=1) - 1e-12).all() and pipeline.sharpen(p, 1.0) is p
+
+
+def test_diagnose_reports_aggregates_that_parse():
+    from possession import diagnose
+    games = [synthetic.match("dg{}".format(i), n_half=2500, seed=80 + i) for i in range(4)]
+    profile = dict(config.DEFAULT_NOISE)
+    with threadpool_limits(limits=1):
+        bundle = pipeline.train(games[:3], profile, quick=True)
+        out = diagnose.report(bundle, games[3][0], games[:3], profile, log=lambda m: None)
+        probs, boundary = pipeline.predict_probs(bundle, games[3][0])
+        assert np.array_equal(pipeline.decode(bundle, probs, boundary, games[3][0].period),
+                              pipeline.predict(bundle, games[3][0]))
+    assert json.loads(diagnose.dumps(out)) == json.loads(json.dumps(out))
+    assert out["model"]["possessions"] > 0 and 0 <= out["model"]["share_unsure"] <= 1
+    assert len(out["features"]["most_shifted"]) == diagnose.TOP_FEATURES
+    assert 0.5 <= out["features"]["classifier_auc"] <= 1.0
+    assert all(side["seen_frames"] > 0 for side in out["ball"].values())
+    assert set(out["ball"]) == {"provided", "copies", "copies_ball_kept_at_stoppages"}
+    assert all(0 <= side["seen_still_share"] <= 1 for side in out["ball"].values())
+    by_ball = out["model"]["dead_share_by_ball"]
+    assert abs(sum(share for share, _ in by_ball.values()) - 1.0) < 0.01
+    assert config.DEAD_BALL_LOSS == 0.9  # put back after the kept copies
+    assert set(out["players"]) == {"provided", "copies"}
+    assert all(0 <= side["players_still_share"] <= 1 for side in out["players"].values())
+
+
+def test_player_view_finds_a_frozen_tracker():
+    from possession import diagnose
+    tracking, _ = synthetic.match("frozen", n_half=600, seed=9)
+    tracking = noise.corrupt(tracking, dict(config.DEFAULT_NOISE), np.random.default_rng(9))
+    assert diagnose.player_view([tracking])["all_players_repeat_share"] == 0
+    players, ball = tracking.players.copy(), tracking.ball.copy()
+    play = np.flatnonzero(tracking.period > 0)
+    frozen = play[100:130]  # 30 frames that repeat the one before them
+    players[frozen], ball[frozen] = players[frozen[0] - 1], ball[frozen[0] - 1]
+    view = diagnose.player_view([tracking.replace(players=players, ball=ball)])
+    assert view["longest_repeat_run"] == 30 and view["all_players_repeat_share"] > 0
+    assert view["repeat_runs_per_1000_frames"][">=25"] > 0
 
 
 def _lose_ball_in_runs(tracking, rng, seen_run=200, lost_run=130):
