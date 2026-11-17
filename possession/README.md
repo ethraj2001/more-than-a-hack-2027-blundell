@@ -520,6 +520,22 @@ them (+0.005 [+0.000, +0.010]). What it cannot catch is tags that agree
 with the tracking yet mean something other than the look-alikes do; and the gain itself is the
 look-alikes' — the real tags' worth is whatever the final score says.
 
+### The last steps before submission
+
+All measured as above: games held out, 90% paired intervals, nothing chosen on the provided match.
+
+| Step | Seven DFL games | Metrica's three | In the submitted model |
+|---|---|---|---|
+| Shortest possession 4 frames instead of 10 (`DECODER_FIXED`) | −0.004 | −0.003 | yes: a short touch between two spells is a possession by definition |
+| Dilated second stage (`DILATED_STAGE`, `dilated.py`) | +0.004 (+0.001 to +0.007) | −0.001 (−0.004 to +0.002) | yes |
+| Written rules: duel and tracking gap (`POSSESSION_RULES`, `rules.py`) | −0.001 (−0.002 to +0.001) | −0.002 (−0.006 to +0.002) | yes |
+| Decoder change weight 0.5, set on Metrica (`build_submission.py`) | −0.007 (−0.012 to −0.002) | +0.009 (+0.000 to +0.018), each game left out in turn | yes |
+| Identity switches across teams in training (`TEAM_SWITCH_RATE` 0.011) | −0.008 (−0.015 to −0.001) | not run | no |
+| Trained on Metrica's games as well (`METRICA_GAMES`) | no held-out check left for it | none | no |
+
+`build_submission.py` holds the settings of the submitted model and builds
+`models/moe_feat_tcn_b05.pkl`; `./model.sh moe_feat_tcn_b05` writes its file.
+
 ### Where the remaining error is
 
 From the DFL labels alone (no model): merging every possession under 10 frames still scores

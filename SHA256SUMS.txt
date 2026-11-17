@@ -1,5 +1,5 @@
 # SHA-256 of the submission. Check with: shasum -a 256 -c SHA256SUMS.txt (from the repository root)
-bd695325f68da021258236ba0323b9f51d2be8b27c9fe46e85eafc89a9ec6434  evaluation/results/Blundell.csv
-236c517d6d71966755d2b2c01dd74bbed0f6003a9f312698df3fa4d60074b71a  models/moe_feat_tcn.pkl
+ccd876c9ea54523a8eee52e0019dfdb6a56036af48a3c1d583f4f36b66d61f4b  evaluation/results/Blundell.csv
+3e2d07782955d66d68965aa564d5a29469825322d3d0f41710e40af540084060  models/moe_feat_tcn_b05.pkl
 5a5123c77e12c7d37f1d5daf2b64a7182f4abcc9a5bcead4369af3db8b152150  models/moe.pkl
-b62bc0bc7e86a6cde15d952e9c2e618d96401c1c96dbc1e7b3537ecd3b09b4cd  Blundell.pdf
+a1ca2e3b3ae8db62a5b68f3053c1393d6c3ecba716baca17f781ff0a13b97303  Blundell.pdf

@@ -418,6 +418,9 @@ DILATED_STAGE = False
 # Identity switches across the teams in the training copies (noise._misfiled): the share of
 # tracklets filed under the other team. The provided ATD has more than eleven tracks on a team on
 # 12.9% of frames (profile: team_overfull_frac); within a team a switch changes no feature.
+# Measured at 0.011 (11.4% of frames overfull), mixture alone, seven DFL games each held out:
+# switches in the test copies cost a model trained without them -0.011 (-0.014 to -0.009);
+# training with them made it worse again, -0.008 (-0.015 to -0.001), better on 2 of 7. Left at 0.
 TEAM_SWITCH_RATE = 0.0
 # The team's written possession rules that can sit on top of the model (rules.py): a duel moves
 # the H/A split toward the nearer team, and in a ball-tracking gap the ball is dead only with slow

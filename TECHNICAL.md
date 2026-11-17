@@ -67,8 +67,13 @@ stoppage at least 10, and every change of possession has a cost. Its settings ar
 best spellF1 on held-out games, except the 4 frames. That is our reading of the definition: a
 brief H A H is one long possession of H, and anything of 4 frames or more may stand on its own.
 It is a choice, not a measured gain: against 10 frames it costs 0.004 on the DFL games and 0.003
-on Metrica's. The table in section 5 compares the approaches at 10 frames; the submitted model,
-with its second stage and rules, reads 0.752 and 0.737 at 4.
+on Metrica's. The table in section 5 compares the approaches at 10 frames; the pipeline with
+its second stage and rules reads 0.752 and 0.737 at 4. One setting was then taken from Metrica's
+games instead of the DFL search: the weight on the gate's change evidence, 0.5 where the DFL
+search chose 1.0. With each Metrica game corrected by the other two it gains +0.009 [+0.000,
++0.018] there, better on 2 of 3, and it costs 0.007 [0.002, 0.012] on the DFL games. (Two of those three
+fits also lowered a dead-ball weight; the fit on all three games, the one submitted, did not.) We took it
+because Metrica's games are the only ones with real tracker output, as the provided match has.
 
 **Smart Tagging** joins as a sixth expert only if the provided match's tags agree with its own
 tracking at least as well as realistic simulated tags do. They passed, after the check found and
@@ -99,8 +104,8 @@ Every model is trained with the teams in both orders, so it cannot learn that "h
 
 ### Result in one line
 
-Each game scored by a model that never saw it, at the submitted settings: **spellF1 0.752** on
-the seven DFL games and **0.737** on Metrica's three sample games, real tracking from the
+Each game scored by a model that never saw it, at the submitted settings: **spellF1 0.745** on
+the seven DFL games and **0.746** on Metrica's three sample games, real tracking from the
 provider of the challenge's data. The published floor on the provided match is 0.243.
 
 ---
@@ -123,7 +128,7 @@ None of it comes from the provided game.
 | Dataset | Source and licence | Who labelled it | Amount | Role |
 |---|---|---|---|---|
 | Seven DFL Bundesliga matches | Bassek et al., *Scientific Data* 2025, CC BY 4.0 | The league's tracking: a per-frame ball status and possessing team. Mechanical, not hand labels by us. | About 1.0 million frames in play, 3,061 possessions | Trains every model. Each game is also held out in turn for validation. |
-| Three Metrica sample games | github.com/metrica-sports/sample-data (no licence stated; the source asks to be acknowledged) | Metrica's own automatic tracking, with human event data. We build per-frame labels from the events by one fixed rule: a team owns the ball from its on-ball event until the other team's next one, and the ball is dead from a ball out, foul, goal or offside until the restart. | About 430,000 frames in play, 1,141 possessions | Validation only. The submitted model does not train on them. |
+| Three Metrica sample games | github.com/metrica-sports/sample-data (no licence stated; the source asks to be acknowledged) | Metrica's own automatic tracking, with human event data. We build per-frame labels from the events by one fixed rule: a team owns the ball from its on-ball event until the other team's next one, and the ball is dead from a ball out, foul, goal or offside until the restart. | About 430,000 frames in play, 1,141 possessions | Validation, and one decoder setting. No model is trained on them. |
 
 The provided match is read without labels for two things only: aggregate noise statistics
 (how often and for how long the ball and players are lost, how smooth the paths are), and the
@@ -202,7 +207,8 @@ No version was chosen on the provided match. Every choice was made on two sets o
   tracking.
 - **Metrica's three sample games.** Real tracker output from the provider of the challenge's
   data. No submitted model trains on them (`config.METRICA_GAMES` is off), so they test whether
-  what was learnt on simulated noise carries to a real tracker.
+  what was learnt on simulated noise carries to a real tracker. One decoder setting was chosen
+  on them at the end, so for that one setting they are not an independent check.
 
 A change was kept only when its 90% paired bootstrap interval excluded zero. The public
 five-minute window was used once, to confirm the file is aligned, and never to pick a version.
@@ -230,7 +236,9 @@ the DFL games, better on 5 of 7, and −0.001 [−0.004, +0.002] on Metrica's, b
 it helps on simulated tracking and not on real tracking. The whole submitted pipeline, second
 stage and the two rules of section 4 included, at 4 frames: 0.752 on the DFL games, +0.005
 [+0.001, +0.009] over the row above and better on 6 of 7, and 0.737 on Metrica's, −0.003
-[−0.009, +0.003], better on 1 of 3. Letting it also replace the gate's
+[−0.009, +0.003], better on 1 of 3. The last step is the decoder's change weight set on Metrica's
+games (section 1): 0.745 on the DFL games and 0.746 on Metrica's, each Metrica game scored with
+the setting chosen on the other two. Letting it also replace the gate's
 change probabilities lost 0.032 and 0.027, so the decoder keeps the gate's.
 
 ![Each late change as a paired difference in held-out spellF1 with its 90% interval](docs/changes.png)
@@ -295,7 +303,7 @@ The absolute level is the uncertain part.
 
 - **The provided match is harder than our validation games.** The published baseline scores
   0.31 on our noisy copies and 0.243 on the provided match. Our models agree with each other
-  less on it than on any held-out game (section 5), and the submitted model finds 315
+  less on it than on any held-out game (section 5), and the submitted model finds 295
   possessions there against about 350 per game on held-out DFL games. We expect a lower score
   than the held-out 0.74.
 - **Label conventions.** The model learns DFL's notion of dead ball and ownership. The procedure
@@ -321,10 +329,10 @@ pip install -r requirements-lock.txt            # the exact versions used
 python -m possession download                   # 7 DFL matches and Metrica's 3 samples, about 2.8 GB
 python -m possession profile                    # noise statistics of the provided tracking
 python -m possession train                      # models/moe.pkl: mixture and flow model
-python build_submission.py models/moe_feat_tcn.pkl   # the submitted model: mixture with lanes,
+python build_submission.py models/moe_feat_tcn_b05.pkl  # the submitted model: mixture with lanes,
                                                 # keepers, turns and the dilated stage, the
                                                 # flow model of moe.pkl, the two rules on
-python -m possession predict --model models/moe_feat_tcn.pkl \
+python -m possession predict --model models/moe_feat_tcn_b05.pkl \
        --out evaluation/results/Blundell.csv --check
 python evaluation/validate_submission.py evaluation/results/Blundell.csv
 ```
@@ -333,11 +341,11 @@ python evaluation/validate_submission.py evaluation/results/Blundell.csv
 file's SHA-256 is
 
 ```
-bd695325f68da021258236ba0323b9f51d2be8b27c9fe46e85eafc89a9ec6434  Blundell.csv
-236c517d6d71966755d2b2c01dd74bbed0f6003a9f312698df3fa4d60074b71a  models/moe_feat_tcn.pkl
+ccd876c9ea54523a8eee52e0019dfdb6a56036af48a3c1d583f4f36b66d61f4b  Blundell.csv
+3e2d07782955d66d68965aa564d5a29469825322d3d0f41710e40af540084060  models/moe_feat_tcn_b05.pkl
 ```
  The model file
-`models/moe_feat_tcn.pkl` is in the repository, and it is what regenerates the submission byte for
+`models/moe_feat_tcn_b05.pkl` is in the repository, and it is what regenerates the submission byte for
 byte: the flow model trains on a GPU, where a retrain is not bit-identical. `python -m possession
 evaluate --quick --jobs 7` gives the held-out scores, and `python -m pytest tests/ -q` runs the
 tests on synthetic data.
@@ -351,7 +359,7 @@ tests on synthetic data.
 - **No human data about the provided match.** Training uses the seven DFL matches only. Smart
   Tagging is Metrica's automatic tagging, an input like the tracking, not a label.
 - **Human data about other games, documented.** Metrica's event data of its three sample games
-  is human-collected. It gives our validation labels (section 3).
+  is human-collected. It gives our validation labels and one decoder setting (sections 1, 3).
 - **No frame-specific constants.** The only frame numbers are the published half blocks.
 - **Public window.** Used only to confirm that the file is aligned and well-formed. No version
   was chosen on it and nothing was tuned on it.
